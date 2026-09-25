@@ -45,8 +45,29 @@ public final class ZeroTrust {
         }
     }
 
-    /** An unpaired device that announced itself (shown so an administrator can pair it; it is not a peer). */
-    public record Sighting(String fingerprint, String name, InetAddress address, Instant lastSeen) {
+    /**
+     * Outcome of a pairing attempt against this device's open PIN (called on the transfer thread: hand off, never
+     * block). The UI shows the verification code next to the one on the new device.
+     */
+    public interface PairingListener {
+        void paired(TrustStore.Device device, String verificationCode);
+
+        /** The attempt failed (wrong PIN, bad key); the PIN is void. */
+        default void failed(String reason) {
+        }
+    }
+
+    /**
+     * An unpaired device that announced itself (shown so an administrator can pair it; it is not a peer).
+     *
+     * @param transferPort the TCP port it announced (where a pairing PIN would be entered), 0 when unknown
+     */
+    public record Sighting(String fingerprint, String name, InetAddress address, int transferPort, Instant lastSeen) {
+        /** {@code host:port} for pairing with it. */
+        public String endpoint() {
+            String host = address.getHostAddress();
+            return (host.indexOf(':') >= 0 ? "[" + host + "]" : host) + ":" + transferPort;
+        }
     }
 
     private final DeviceIdentity identity;
@@ -54,6 +75,8 @@ public final class ZeroTrust {
     private final AtomicReference<PairingTicket> ticket = new AtomicReference<>();
     private final ConcurrentHashMap<String, Sighting> sightings = new ConcurrentHashMap<>();
     private volatile String localName = "device";
+    private final java.util.concurrent.CopyOnWriteArrayList<PairingListener> pairingListeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
 
     public ZeroTrust(DeviceIdentity identity, TrustStore trust) {
         this.identity = Objects.requireNonNull(identity, "identity must not be null");
@@ -113,6 +136,32 @@ public final class ZeroTrust {
         return t == null || t.expired() ? Optional.empty() : Optional.of(t);
     }
 
+    /** Registers a listener for pairings with this device's PIN; run the returned action to remove it. */
+    public Runnable onPairing(PairingListener listener) {
+        pairingListeners.add(Objects.requireNonNull(listener, "listener"));
+        return () -> pairingListeners.remove(listener);
+    }
+
+    void firePaired(TrustStore.Device device, String code) {
+        for (PairingListener l : pairingListeners) {
+            try {
+                l.paired(device, code);
+            } catch (RuntimeException e) {
+                System.getLogger(ZeroTrust.class.getName()).log(System.Logger.Level.WARNING, "Pairing listener failed", e);
+            }
+        }
+    }
+
+    void firePairingFailed(String reason) {
+        for (PairingListener l : pairingListeners) {
+            try {
+                l.failed(reason);
+            } catch (RuntimeException e) {
+                System.getLogger(ZeroTrust.class.getName()).log(System.Logger.Level.WARNING, "Pairing listener failed", e);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ access rules
 
     /** Whether {@code device} may see (in its catalog) and pull this document from {@code store}. */
@@ -162,7 +211,7 @@ public final class ZeroTrust {
 
     // ------------------------------------------------------------------ unpaired devices seen on the network
 
-    void sighted(String fingerprint, String name, InetAddress address) {
+    void sighted(String fingerprint, String name, InetAddress address, int transferPort) {
         if (sightings.size() >= MAX_SIGHTINGS && !sightings.containsKey(fingerprint)) {
             Instant cutoff = Instant.now().minus(Duration.ofMinutes(10));
             sightings.values().removeIf(s -> s.lastSeen().isBefore(cutoff));
@@ -170,7 +219,8 @@ public final class ZeroTrust {
                 return;
             }
         }
-        sightings.put(fingerprint, new Sighting(fingerprint, TrustStore.name(name), address, Instant.now()));
+        sightings.put(fingerprint, new Sighting(fingerprint, TrustStore.name(name), address,
+                transferPort >= 1 && transferPort <= 65_535 ? transferPort : 0, Instant.now()));
     }
 
     /** Unpaired devices announced within the last ten minutes (newest first). */

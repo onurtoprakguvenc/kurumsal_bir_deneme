@@ -63,6 +63,8 @@ final class AdminPanelDialog extends Dialog<Void> {
     private final Function<String, CompletableFuture<InternalTerminalEngine.Outcome>> command;
     private final Consumer<Path> reveal;
     private final List<Runnable> refreshers = new ArrayList<>();
+    private final TabPane tabs;
+    private final Tab devicesTab;
 
     /**
      * @param command runs a terminal command in the active project (its outcome completes the future)
@@ -79,9 +81,13 @@ final class AdminPanelDialog extends Dialog<Void> {
         setHeaderText("BT yönetimi · " + AppInfo.host() + " · sürüm " + AppInfo.version());
         setResizable(true);
 
-        TabPane tabs = new TabPane(
+        TrustedDevicesPane devices = new TrustedDevicesPane(ext, controller, this::child);
+        refreshers.add(devices::refresh);
+        devicesTab = tab("Cihazlar", devices);
+        tabs = new TabPane(
                 tab("Genel", overview()),
                 tab("Politika", policy()),
+                devicesTab,
                 tab("Sağlık", health()),
                 tab("Denetim Kaydı", audit()),
                 tab("Destek", support()));
@@ -90,6 +96,21 @@ final class AdminPanelDialog extends Dialog<Void> {
         getDialogPane().setContent(tabs);
         getDialogPane().getButtonTypes().setAll(new ButtonType("Kapat", ButtonBar.ButtonData.CANCEL_CLOSE));
         refreshAll();
+    }
+
+    /** Opens on the zero-trust device management page (the status bar's security badge). */
+    void showDevices() {
+        tabs.getSelectionModel().select(devicesTab);
+    }
+
+    /** A dialog opened from this window: same owner chain and stylesheet. */
+    private Dialog<?> child(Dialog<?> dialog) {
+        if (getDialogPane().getScene() != null && getDialogPane().getScene().getWindow() != null) {
+            dialog.initOwner(getDialogPane().getScene().getWindow());
+        }
+        dialog.getDialogPane().getStylesheets().setAll(getDialogPane().getStylesheets());
+        dialog.getDialogPane().getStyleClass().add("dwb-dialog");
+        return dialog;
     }
 
     private static Tab tab(String title, Node content) {
@@ -248,8 +269,16 @@ final class AdminPanelDialog extends Dialog<Void> {
                     || p.overrides("DWB_AI_HOURS") || p.overrides("DWB_AI_DAYS"));
             row(table, r++, "Web araması", !p.webAllowed() ? "KAPALI" : ext.web().config().configured()
                     ? String.valueOf(ext.web().config().endpoint()) : "yapılandırılmamış", p.webLocked());
-            row(table, r++, "Ağ paylaşımı (konsol)", !p.lanAllowed() ? "KAPALI"
+            row(table, r++, "Ağ paylaşımı", !p.lanAllowed() ? "KAPALI"
                     : p.lanRequiresSecret() ? "yalnız kimliği doğrulanmış eşlerle" : "izinli", !p.lanAllowed() || p.lanRequiresSecret());
+            ExtendedWorkbenchController.LanShield shield = ext.lanShield();
+            row(table, r++, "Güven modu", switch (shield.kind()) {
+                case ZERO_TRUST -> "sıfır güven · v3 şifreli tünel (AES-256-GCM)";
+                case LEGACY_SECRET -> "legacy · DWB_SECRET (şifresiz)";
+                case LEGACY_OPEN -> "legacy · açık mod (şifresiz)";
+                case STARTING -> "başlatılıyor…";
+                case OFF -> "kapalı · " + shield.reason();
+            }, p.overrides("DWB_TRUST"));
             row(table, r++, "Sağlık raporu", p.reportFolder().map(f -> f + " · " + p.reportIntervalMinutes() + " dk")
                     .orElse("kapalı"), p.reportFolder().isPresent());
             row(table, r, "Destek klasörü", p.supportFolder().map(Path::toString).orElse("masaüstü"),

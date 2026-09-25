@@ -2,7 +2,6 @@ package org.example.p2p;
 
 import org.example.util.Hashing;
 
-import javax.crypto.KeyAgreement;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.DataInputStream;
@@ -13,12 +12,9 @@ import java.net.InetAddress;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
-import java.security.PublicKey;
-import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
 import java.util.Optional;
 
@@ -74,6 +70,7 @@ final class Pairing {
         }
         if (!DeviceIdentity.validPublicKey(keyC)) {
             LanConsole.failed("Pairing request from " + who + " refused: invalid device key; the PIN is void");
+            trust.firePairingFailed(who + ": invalid device key; the PIN is void");
             return;
         }
         byte[] ephS;
@@ -84,6 +81,7 @@ final class Pairing {
             secret = agree(eph, ephC);
         } catch (GeneralSecurityException e) {
             LanConsole.failed("Pairing request from " + who + " refused: bad key exchange; the PIN is void");
+            trust.firePairingFailed(who + ": bad key exchange; the PIN is void");
             return;
         }
         String nameS = trust.localName();
@@ -100,15 +98,18 @@ final class Pairing {
         if (!MessageDigest.isEqual(proofC, mac(k, CLIENT, pin)) || !DeviceIdentity.verify(keyC, sigC, LABEL_CLIENT_SIG, t)) {
             LanConsole.failed("Pairing with " + who + " failed: wrong PIN or key proof; the PIN is void, create a new"
                     + " one to try again");
+            trust.firePairingFailed(who + ": wrong PIN or key proof; the PIN is void");
             return;
         }
         TrustStore.Device device = trust.trust().add(keyC, nameC, ticket.get().role(), ticket.get().department());
         out.write(mac(k, SERVER, pin));
         out.write(trust.identity().sign(LABEL_SERVER_SIG, t));
         out.flush();
+        String code = code(k);
         LanConsole.success("Paired " + who + " as " + device.labels() + " · device "
-                + DeviceIdentity.display(device.fingerprint()) + " · verification code " + code(k)
+                + DeviceIdentity.display(device.fingerprint()) + " · verification code " + code
                 + " (the new device must show the same code; if not, remove it with the devices command)");
+        trust.firePaired(device, code);
     }
 
     /** Client half: runs the exchange with an open PIN on the server. */
@@ -171,19 +172,7 @@ final class Pairing {
     }
 
     private static byte[] agree(KeyPair own, byte[] peerEncoded) throws GeneralSecurityException {
-        PublicKey peer = KeyFactory.getInstance(KEX).generatePublic(new X509EncodedKeySpec(peerEncoded));
-        KeyAgreement ka = KeyAgreement.getInstance(KEX);
-        ka.init(own.getPrivate());
-        ka.doPhase(peer, true);
-        byte[] secret = ka.generateSecret();
-        boolean allZero = true;
-        for (byte b : secret) {
-            allZero &= b == 0;
-        }
-        if (allZero) {
-            throw new java.security.InvalidKeyException("low-order X25519 point");
-        }
-        return secret;
+        return SecureChannel.agree(own, peerEncoded);
     }
 
     private static byte[] key(byte[] secret, byte[] transcript) {

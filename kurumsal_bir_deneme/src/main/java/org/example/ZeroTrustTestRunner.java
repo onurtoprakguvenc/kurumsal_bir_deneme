@@ -1,5 +1,6 @@
 package org.example;
 
+import org.example.admin.AdminControlEngine;
 import org.example.core.Workbench;
 import org.example.index.InvertedIndex;
 import org.example.ingest.DocumentParser;
@@ -18,6 +19,7 @@ import org.example.p2p.ZeroTrust;
 import org.example.platform.OsShellBridge;
 import org.example.repl.InternalTerminalEngine;
 import org.example.util.Hashing;
+import org.example.workbench.ExtendedWorkbenchController;
 import org.example.workbench.WorkbenchController;
 
 import java.io.DataInputStream;
@@ -55,6 +57,9 @@ import java.util.stream.Stream;
  *   <li>Resume integrity: a partial whose last block differs is never extended.</li>
  *   <li>Two synced nodes plus an unpaired one: signed announcements, no catalog on the wire, nothing reaches the
  *       unpaired node.</li>
+ *   <li>Encrypted tunnel: no content, name or hash on the wire, tampering on the path caught, resume across
+ *       tunnels, 256 MiB streamed under a 300 MB heap.</li>
+ *   <li>Admin lock: opening a pairing PIN and revoking a device need an unlocked admin session (GUI and terminal).</li>
  * </ol>
  *
  * <pre>gradle -q runZeroTrustTests</pre>
@@ -63,7 +68,7 @@ public final class ZeroTrustTestRunner {
 
     private static final InetAddress LOOPBACK = InetAddress.getLoopbackAddress();
     private static final MachineKey MACHINE = MachineKey.of("test-machine-0001");
-    private static final long MAX = 64L << 20;
+    private static final long MAX = 1L << 30;
 
     private int passed;
     private final List<String> failures = new ArrayList<>();
@@ -75,6 +80,8 @@ public final class ZeroTrustTestRunner {
             runner.identity(root.resolve("identity"));
             runner.handshakeAndPairing(root.resolve("pairing"));
             runner.endToEnd(root.resolve("e2e"));
+            runner.tunnel(root.resolve("tunnel"));
+            runner.adminLock(root.resolve("admin"));
         } finally {
             deleteRecursively(root);
         }
@@ -172,7 +179,7 @@ public final class ZeroTrustTestRunner {
                     && !Files.exists(b.store().partialPath(sha1)), "");
             check("the refused device is not in the server's trust list", !a.trust().trust().trusted(b.fp()), "");
             check("the server says nothing to a client that does not complete the handshake",
-                    rawClose(a, "DWBT\u0002\u0001garbage".getBytes(StandardCharsets.ISO_8859_1)), "");
+                    rawClose(a, "DWBT\u0003\u0001garbage".getBytes(StandardCharsets.ISO_8859_1)), "");
             check("a legacy (v1) request gets no answer either",
                     rawClose(a, new byte[]{'D', 'W', 'B', 'T', 1, 2}), "");
             long started = System.nanoTime();
@@ -439,6 +446,271 @@ public final class ZeroTrustTestRunner {
         LanSyncService sync = new LanSyncService(settings, controller, project, null);
         sync.start();
         return new SyncNode(name, project, controller, sync, trust);
+    }
+
+    // ================================================================== 7. encrypted tunnel
+
+    /**
+     * A TCP relay between a client and a server on loopback: records what crosses it (up to a cap) and can flip one
+     * byte of the server-to-client stream, like an attacker on the network path.
+     */
+    private static final class Relay implements AutoCloseable {
+        private final java.net.ServerSocket listener = new java.net.ServerSocket(0, 50, LOOPBACK);
+        private final InetSocketAddress target;
+        private final java.io.ByteArrayOutputStream seen = new java.io.ByteArrayOutputStream();
+        private final long tamperAt;
+        private final int recordLimit;
+
+        Relay(InetSocketAddress target, long tamperAt, int recordLimit) throws IOException {
+            this.target = target;
+            this.tamperAt = tamperAt;
+            this.recordLimit = recordLimit;
+            Thread.ofVirtual().start(this::acceptLoop);
+        }
+
+        InetSocketAddress endpoint() {
+            return new InetSocketAddress(LOOPBACK, listener.getLocalPort());
+        }
+
+        synchronized byte[] seen() {
+            return seen.toByteArray();
+        }
+
+        private void acceptLoop() {
+            while (!listener.isClosed()) {
+                try {
+                    Socket client = listener.accept();
+                    Socket server = new Socket();
+                    server.connect(target, 2_000);
+                    Thread.ofVirtual().start(() -> pump(client, server, -1));
+                    Thread.ofVirtual().start(() -> pump(server, client, tamperAt));
+                } catch (IOException e) {
+                    return;
+                }
+            }
+        }
+
+        private void pump(Socket from, Socket to, long flipAt) {
+            byte[] buffer = new byte[16 * 1024];
+            long total = 0;
+            try (from; to) {
+                InputStream in = from.getInputStream();
+                OutputStream out = to.getOutputStream();
+                int n;
+                while ((n = in.read(buffer)) > 0) {
+                    if (flipAt >= total && flipAt < total + n) {
+                        buffer[(int) (flipAt - total)] ^= 0x20;
+                    }
+                    total += n;
+                    synchronized (this) {
+                        if (seen.size() < recordLimit) {
+                            seen.write(buffer, 0, Math.min(n, recordLimit - seen.size()));
+                        }
+                    }
+                    out.write(buffer, 0, n);
+                }
+            } catch (IOException e) {
+                // one side closed
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            listener.close();
+        }
+    }
+
+    private void tunnel(Path root) throws Exception {
+        try (Node a = node(root.resolve("a"), "Sunucu");
+             Node b = node(root.resolve("b"), "Istemci")) {
+            ZeroTrust.PairingTicket ticket = a.trust().openPairing(DeviceRole.FULL_PEER, "");
+            b.service().pair(a.endpoint(), ticket.pin(), b.name());
+
+            section("encrypted tunnel: nothing readable on the wire");
+            String marker = "KARTALKANAT-GIZLI-SOZLESME-";
+            Path contract = write(root.resolve("files/Gizli Sozlesme Taslagi.txt"), (marker + "bedel 4.750.000 TL\n").repeat(5_000));
+            String sha = Hashing.sha256Hex(contract);
+            a.store().register(sha, contract, "Gizli Sozlesme Taslagi.txt");
+            try (Relay sniffer = new Relay(a.endpoint(), -1, 8 << 20)) {
+                Set<String> catalog = b.service().catalog(sniffer.endpoint(), a.fp());
+                TransferResult pulled = b.service().pull(sniffer.endpoint(), a.fp(), sha, FileTransferService.Progress.NONE);
+                check("pull through the tunnel verifies (SHA-256) and commits",
+                        pulled.outcome() == FileTransferService.Outcome.RECEIVED && catalog.contains(sha)
+                                && Hashing.sha256Hex(pulled.file().path()).equals(sha), "");
+                Path upload = write(root.resolve("files/Maas Tablosu.csv"), ("personel;" + marker + "maas\n").repeat(3_000));
+                String upSha = Hashing.sha256Hex(upload);
+                b.store().register(upSha, upload, "Maas Tablosu.csv");
+                TransferResult pushed = b.service().push(sniffer.endpoint(), a.fp(), upSha, FileTransferService.Progress.NONE);
+                check("push through the tunnel verifies and commits", pushed.outcome() == FileTransferService.Outcome.SENT
+                        && a.store().has(upSha), "");
+                byte[] wire = sniffer.seen();
+                String text = new String(wire, StandardCharsets.ISO_8859_1);
+                String utf8 = new String(wire, StandardCharsets.UTF_8);
+                check("the recording holds the whole exchange (sanity)", wire.length > 200_000, wire.length + " bytes");
+                check("file contents never appear on the wire", !text.contains(marker) && !utf8.contains("bedel"), "");
+                check("file names never appear on the wire", !utf8.contains("Gizli Sozlesme") && !utf8.contains("Maas Tablosu"),
+                        "");
+                check("content hashes (hex or raw) never appear on the wire", !text.contains(sha) && !text.contains(upSha)
+                        && indexOf(wire, Hashing.fromHex(sha)) < 0 && indexOf(wire, Hashing.fromHex(upSha)) < 0, "");
+            }
+
+            section("encrypted tunnel: tampering on the path, then resume");
+            byte[] big = new byte[3_000_000];
+            new Random(21).nextBytes(big);
+            Path video = root.resolve("files/kamera.mp4");
+            Files.write(video, big);
+            String videoSha = Hashing.sha256Hex(video);
+            a.store().register(videoSha, video, "kamera.mp4");
+            String error = "";
+            try (Relay attacker = new Relay(a.endpoint(), 1_500_000, 0)) {
+                b.service().pull(attacker.endpoint(), a.fp(), videoSha, FileTransferService.Progress.NONE);
+            } catch (IOException e) {
+                error = e.getMessage();
+            }
+            check("one flipped bit on the path breaks the frame authentication; nothing is committed",
+                    error.contains("authentication") && !b.store().has(videoSha), error);
+            Path partial = b.store().partialPath(videoSha);
+            long kept = Files.exists(partial) ? Files.size(partial) : 0;
+            boolean prefixIntact = kept > 0 && java.util.Arrays.equals(Files.readAllBytes(partial),
+                    java.util.Arrays.copyOf(big, (int) kept));
+            check("only authenticated bytes reached the disk (the partial is an exact prefix of the file)",
+                    prefixIntact && kept < 1_500_000, kept + " bytes kept");
+            TransferResult resumed = b.service().pull(a.endpoint(), a.fp(), videoSha, FileTransferService.Progress.NONE);
+            check("the next pull resumes from the kept prefix through a new tunnel and verifies the whole file",
+                    resumed.resumedFrom() == kept && Hashing.sha256Hex(resumed.file().path()).equals(videoSha),
+                    "resumed at " + resumed.resumedFrom());
+            String bad = "";
+            try (Relay attacker = new Relay(a.endpoint(), 60, 0)) {
+                b.service().catalog(attacker.endpoint(), a.fp());
+            } catch (IOException e) {
+                bad = e.getMessage();
+            }
+            check("tampering during the handshake is caught before anything is exchanged", !bad.isEmpty(), bad);
+
+            section("encrypted tunnel: 256 MiB under the 300 MB heap ceiling");
+            Path huge = root.resolve("files/arsiv-256.bin");
+            byte[] chunk = new byte[1 << 20];
+            new Random(22).nextBytes(chunk);
+            try (OutputStream out = Files.newOutputStream(huge)) {
+                for (int i = 0; i < 256; i++) {
+                    chunk[0] = (byte) i;
+                    out.write(chunk);
+                }
+            }
+            String hugeSha = Hashing.sha256Hex(huge);
+            a.store().register(hugeSha, huge, "arsiv-256.bin");
+            System.gc();
+            for (java.lang.management.MemoryPoolMXBean pool : java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+                pool.resetPeakUsage();
+            }
+            long started = System.nanoTime();
+            TransferResult hugePull = b.service().pull(a.endpoint(), a.fp(), hugeSha, FileTransferService.Progress.NONE);
+            long millis = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+            long peak = 0;
+            for (java.lang.management.MemoryPoolMXBean pool : java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+                if (pool.getType() == java.lang.management.MemoryType.HEAP) {
+                    peak += pool.getPeakUsage().getUsed();
+                }
+            }
+            long maxHeap = Runtime.getRuntime().maxMemory();
+            check("256 MiB transferred through the tunnel and SHA-256 verified",
+                    hugePull.outcome() == FileTransferService.Outcome.RECEIVED && hugePull.bytes() == 256L << 20, "");
+            check("the JVM runs under the 300 MB ceiling (-Xmx300m)", maxHeap <= 300L << 20, (maxHeap >> 20) + " MB");
+            check("peak heap during the transfer stays far below the ceiling (streaming, 64 KiB frames)",
+                    peak < 100L << 20, (peak >> 20) + " MB");
+            System.out.printf("        (%d MiB in %d ms = %.0f MB/s, both ends in this JVM, peak heap %d MB)%n", 256,
+                    millis, 256.0 * 1_048_576 / 1e6 / (millis / 1000.0), peak >> 20);
+            Files.deleteIfExists(huge);
+            Files.deleteIfExists(hugePull.file().path());
+        }
+    }
+
+    // ================================================================== 8. admin lock on pairing and revocation
+
+    private void adminLock(Path root) throws Exception {
+        section("admin lock: pairing and revocation need an unlocked admin session");
+        Path home = Files.createDirectories(root.resolve("workspace"));
+        Path identityHome = home.resolve("identity");
+        ZeroTrust seed = ZeroTrust.load(identityHome, MACHINE);
+        DeviceIdentity colleague = DeviceIdentity.loadOrCreate(root.resolve("colleague"), MACHINE);
+        DeviceIdentity veteran = DeviceIdentity.loadOrCreate(root.resolve("veteran"), MACHINE);
+        seed.trust().add(veteran.publicKey(), "Eski-Laptop", DeviceRole.FULL_PEER, "");
+        // Back-date the veteran's pairing by an hour: established, not "just paired".
+        Path list = identityHome.resolve(TrustStore.FILE);
+        String text = Files.readString(list);
+        String added = text.substring(text.lastIndexOf('\t') + 1).strip();
+        Files.writeString(list, text.replace(added, Long.toString(Long.parseLong(added) - 3_600_000)));
+
+        String token = "gizli-dagitim-anahtari";
+        ExtendedWorkbenchController.Services services = new ExtendedWorkbenchController.Services(new DocumentParser(),
+                null, java.util.Optional::empty, null, null, null, token);
+        try (ExtendedWorkbenchController ext = new ExtendedWorkbenchController(
+                ExtendedWorkbenchController.Config.defaults(home), services)) {
+            ZeroTrust trust = ZeroTrust.load(identityHome, MACHINE);
+            ext.enableLanSync(new LanSyncService.Settings(null, "Kilitli", InetAddress.getByName(PeerDiscovery.DEFAULT_GROUP),
+                    freeUdpPort(), 0, Duration.ofSeconds(1), Duration.ofSeconds(10), List.of(), null, 0, trust));
+            ext.start();
+            waitFor(() -> ext.lanShield().kind() == ExtendedWorkbenchController.LanShieldKind.ZERO_TRUST);
+            check("with an admin passphrase/token configured the session starts locked",
+                    ext.admin().protectedMode() && !ext.lanAdminUnlocked(), "");
+
+            String denied = privilegeError(() -> ext.lanOpenPairing(DeviceRole.FULL_PEER, ""));
+            check("a locked session cannot open a pairing PIN", denied.contains("admin unlock")
+                    && trust.pendingPairing().isEmpty(), denied);
+            InternalTerminalEngine.Outcome viaTerminal = ext.terminal().execute("lan-pair --new");
+            check("the terminal command is locked the same way (no bypass)", !viaTerminal.succeeded()
+                    && trust.pendingPairing().isEmpty(), viaTerminal.toString());
+
+            trust.trust().add(colleague.publicKey(), "Finans-Laptop", DeviceRole.FULL_PEER, "");
+            String revokeDenied = privilegeError(() -> ext.lanRevoke("Finans-Laptop"));
+            check("a locked session cannot revoke a trusted device", revokeDenied.contains("admin unlock")
+                    && trust.trust().trusted(colleague.fingerprint()), revokeDenied);
+            InternalTerminalEngine.Outcome removeViaTerminal = ext.terminal().execute("lan-devices --remove Finans-Laptop");
+            check("lan-devices --remove is locked too", !removeViaTerminal.succeeded()
+                    && trust.trust().trusted(colleague.fingerprint()), removeViaTerminal.toString());
+            check("denials are recorded in the audit log", ext.admin().audit().tail(50).stream()
+                    .anyMatch(l -> l.contains("SECURITY") && l.contains("lan-pair --new") && l.contains("denied")), "");
+
+            ext.lanRejectPairing(colleague.fingerprint());
+            check("rejecting a pairing made moments ago (codes differed) works without the admin session",
+                    !trust.trust().trusted(colleague.fingerprint()), "");
+            String old = "";
+            try {
+                ext.lanRejectPairing(veteran.fingerprint());
+            } catch (IllegalArgumentException e) {
+                old = e.getMessage();
+            }
+            check("but it cannot remove an established device (that stays admin-locked)",
+                    old.contains("last 5 minutes") && trust.trust().trusted(veteran.fingerprint()), old);
+
+            check("a wrong passphrase does not unlock", ext.admin().unlock("yanlis".toCharArray())
+                    instanceof AdminControlEngine.UnlockResult.Denied && !ext.lanAdminUnlocked(), "");
+            check("the right passphrase unlocks", ext.admin().unlock(token.toCharArray())
+                    instanceof AdminControlEngine.UnlockResult.Unlocked && ext.lanAdminUnlocked(), "");
+            ZeroTrust.PairingTicket ticket = ext.lanOpenPairing(DeviceRole.RESTRICTED_GUEST, "");
+            check("unlocked: a pairing PIN opens", ticket.pin().matches("\\d{6}") && trust.pendingPairing().isPresent(), "");
+            ext.lanRevoke("Eski-Laptop");
+            check("unlocked: an established device is revoked", !trust.trust().trusted(veteran.fingerprint()), "");
+            ext.admin().lock();
+            check("locking again closes both actions", privilegeError(() -> ext.lanOpenPairing(DeviceRole.FULL_PEER, ""))
+                    .contains("admin unlock"), "");
+        }
+    }
+
+    @FunctionalInterface
+    private interface Action {
+        void run() throws Exception;
+    }
+
+    private static String privilegeError(Action action) {
+        try {
+            action.run();
+            return "(allowed)";
+        } catch (AdminControlEngine.PrivilegeException e) {
+            return e.getMessage();
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
     }
 
     // ================================================================== helpers

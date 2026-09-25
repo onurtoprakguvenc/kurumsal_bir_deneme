@@ -123,7 +123,24 @@ izidir.
   karşılaştırılır; uyuşmazsa aktarım baştan başlar. Tamamlanan dosya her durumda SHA-256 ile doğrulanır.
 * **Eski mod:** Tüm bilgisayarlarda `DWB_TRUST=legacy` (ya da politikada `lan.trustMode=legacy`) eski protokole
   döner (açık mod veya `DWB_SECRET`). İki mod birbiriyle konuşmaz; geçişi tüm bilgisayarlarda birlikte yapın.
-* Aktarım kanalı şifrelenmez (önceki sürümdeki gibi); kimlik doğrulama, istek imzası ve içerik bütünlüğü sağlanır.
+* **Şifreli tünel:** El sıkışmada her oturum için tek kullanımlık X25519 anahtarları (cihaz imzasıyla bağlı) değiş
+  tokuş edilir; HKDF-SHA256 ile yön başına bir AES-256 anahtarı türetilir. El sıkışmadan sonraki her bayt (istek,
+  dosya adı, hash, dosya içeriği) 64 KB'lık AES-GCM çerçeveleriyle gider; çerçeve sayacı tekrar/yer değiştirme
+  saldırılarını engeller. Ağı dinleyen biri yalnızca cihaz açık anahtarlarını ve aktarım boyutunu görebilir.
+  Eski mod (`DWB_TRUST=legacy`) şifrelenmez.
+
+**Arayüzden:** Yönetim Paneli → **Cihazlar** sekmesi: “➕ Yeni Cihaz Eşleştir” (tek tıkla PIN, geri sayım, karşı
+cihaz bağlanınca doğrulama kodu), “Bir Cihaza Katıl…”, güvenilen cihaz tablosu (rol ve departman doğrudan
+değiştirilir, “Güvenden Çıkar” tek tık) ve belge erişim listeleri. Durum çubuğundaki rozet modu gösterir
+(“🔒 Zero-Trust aktif [v3 şifreli]” / “Legacy Mod”); tıklanınca bu sekme açılır. Biten her aktarım durum çubuğunda
+kilitle (şifreli) ya da uyarıyla (legacy, şifresiz) birkaç saniye gösterilir.
+
+**Yönetici kilidi:** “Yeni Cihaz Eşleştir” (`lan-pair --new`) ve “Güvenden Çıkar” (`lan-devices --remove`) yönetici
+oturumu ister; kilit kapalıysa buton 🔒 ile görünür ve tıklanınca yönetici parolası sorulur. Reddedilen denemeler
+denetim kaydına `SECURITY` olarak yazılır. Yönetici parolası (`admin.passphrase.hash`) ya da dağıtım anahtarı
+tanımlı değilse kilit de yoktur; kurumsal kurulumda parolayı merkezi politikada tanımlayın. İstisna: doğrulama
+kodları farklı çıktığında “Kodlar farklı — Güvenden çıkar” son 5 dakikada eşleşmiş cihazı kilitsiz geri alır
+(araya giren birini hemen kesmek için); kurulu cihazları kaldırmak her zaman yönetici ister.
 
 Konsol düğümünde (`dwb-cli`) aynı işlemler: `devices`, `pair --new`, `pair <eş|adres:port> <PIN>`, `acl`.
 

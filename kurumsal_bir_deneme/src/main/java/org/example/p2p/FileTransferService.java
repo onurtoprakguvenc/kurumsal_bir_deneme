@@ -48,15 +48,19 @@ import java.util.concurrent.Semaphore;
  *        server → NOT_FOUND | DENIED | FOUND size:u64 offset:u64 nameLen:u16 name, then bytes[offset..size)
  * </pre>
  *
- * <p>Protocol v2, zero-trust mode (the default, see {@link ZeroTrust}). Nothing about a file (no name, no hash, no
- * size) is sent before both devices proved their identity; any failure or a silence longer than
- * {@value #HANDSHAKE_TIMEOUT_MILLIS} ms closes the socket without a word:</p>
+ * <p>Protocol v3, zero-trust mode (the default, see {@link ZeroTrust}). Nothing about a file (no name, no hash, no
+ * size) is sent before both devices proved their identity, and nothing after that travels in the clear: any failure
+ * or a silence longer than {@value #HANDSHAKE_TIMEOUT_MILLIS} ms closes the socket without a word:</p>
  * <pre>
- *   server → HELLO   "DWBT" 2 challengeS:32
- *   client → AUTH    "DWBT" 2 kind=1 key:blob challengeC:32 sig:64    sig = Ed25519(client, "client" | challengeS | challengeC)
+ *   server → HELLO   "DWBT" 3 challengeS:32
+ *   client → AUTH    "DWBT" 3 kind=1 key:blob challengeC:32 ephC:blob sig:64
+ *                    sig = Ed25519(client, "client" | challengeS | challengeC | ephC)
  *            server: signature valid AND key in trusted-peers, else close()
- *   server → AUTH    key:blob sig:64                                  sig = Ed25519(server, "server" | challengeS | challengeC | clientKey)
+ *   server → AUTH    key:blob ephS:blob sig:64
+ *                    sig = Ed25519(server, "server" | challengeS | challengeC | clientKey | ephC | ephS)
  *            client: signature valid AND key in its own trusted-peers (and the expected device), else close()
+ *   both   → keys = HKDF-SHA256(X25519(eph), transcript); from here on every byte in both directions is an
+ *            AES-256-GCM frame of {@link SecureChannel} (request, statuses, file bytes, acknowledgements)
  *   client → REQUEST req:blob sig:64                                  sig = Ed25519(client, "request" | challengeS | challengeC | req)
  *   CATALOG req = op                         server → count:u32 sha256:32…   (only what this device may see)
  *   GET     req = op sha256 offset:u64 tail:32
@@ -71,7 +75,8 @@ import java.util.concurrent.Semaphore;
  * resume offset ({@code [offset - min(offset, BLOCK), offset)}): a resumed transfer continues only when both sides
  * hold the same bytes there, otherwise it starts over at 0, so bytes injected into a partial file are caught at the
  * handshake instead of after gigabytes. Signing the request binds operation, hash, offset and name to the
- * authenticated session. The transport itself is not encrypted in either protocol.</p>
+ * authenticated session. The legacy protocol v1 is not encrypted; v3 is (see {@link SecureChannel}). Resume and the
+ * final SHA-256 check work on the decrypted bytes, exactly as in v1.</p>
  *
  * <p>The receiving side always re-hashes the complete file (resumed prefix included) and only commits bytes whose
  * SHA-256 equals the requested address; interrupted transfers keep their partial file and resume from its
@@ -124,7 +129,9 @@ public final class FileTransferService implements AutoCloseable {
     private static final int OP_CATALOG = 3;
 
     /** Zero-trust protocol (v2): challenge-response handshake with device keys. */
-    static final int VERSION_ZERO_TRUST = 2;
+    static final int VERSION_ZERO_TRUST = 3;
+    /** The first zero-trust release, without the encrypted tunnel; refused with an "update" message. */
+    private static final int VERSION_ZERO_TRUST_PLAIN = 2;
     static final int CHALLENGE_BYTES = 32;
     /** Handshake (and pairing) must be complete within this time, whatever the peer sends meanwhile. */
     static final int HANDSHAKE_TIMEOUT_MILLIS = 10_000;
@@ -134,9 +141,10 @@ public final class FileTransferService implements AutoCloseable {
     private static final int MAX_CATALOG = 100_000;
     private static final int CONTINUE = 0;
     private static final int RESTART = 1;
-    private static final byte[] LABEL_CLIENT = "dwbt2/client".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] LABEL_SERVER = "dwbt2/server".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] LABEL_REQUEST = "dwbt2/request".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] LABEL_CLIENT = "dwbt3/client".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] LABEL_SERVER = "dwbt3/server".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] LABEL_REQUEST = "dwbt3/request".getBytes(StandardCharsets.US_ASCII);
+    private static final int MAX_EPHEMERAL_BYTES = 128;
     private static final byte[] NO_TAIL = new byte[Hashing.SHA256_BYTES];
     /** Refused devices are reported on the console at most this often each (the log gets every refusal). */
     private static final long DENIAL_REPORT_MILLIS = 5 * 60_000L;
@@ -169,6 +177,16 @@ public final class FileTransferService implements AutoCloseable {
         Progress NONE = (transferred, total) -> { };
     }
 
+    /**
+     * A peer finished pulling a file from this node ({@code device} is the trusted device's name in zero-trust mode,
+     * {@code null} in legacy mode; {@code encrypted} tells whether it went through the AES-GCM tunnel). Called on the
+     * transfer thread: hand off, never block.
+     */
+    @FunctionalInterface
+    public interface SendListener {
+        void sent(StoredFile file, InetAddress to, String device, boolean encrypted);
+    }
+
     public enum Outcome { SENT, RECEIVED, ALREADY_PRESENT }
 
     public record TransferResult(Outcome outcome, String sha256, long bytes, long resumedFrom, long millis,
@@ -184,8 +202,21 @@ public final class FileTransferService implements AutoCloseable {
         }
     }
 
-    /** The trusted device on the other end of a zero-trust session (and the session's challenges). */
-    private record Session(TrustStore.Device device, byte[] challengeS, byte[] challengeC) {
+    /**
+     * The trusted device on the other end of a zero-trust session, the session's challenges and the encrypted streams
+     * everything after the handshake goes through.
+     */
+    private record Session(TrustStore.Device device, byte[] challengeS, byte[] challengeC, DataInputStream in,
+                           DataOutputStream out) {
+    }
+
+    /** Wraps the handshake streams into the session's AES-GCM tunnel. */
+    private static Session tunnel(TrustStore.Device device, byte[] challengeS, byte[] challengeC, byte[] secret,
+                                  byte[] transcript, boolean client, DataInputStream in, DataOutputStream out) {
+        SecureChannel.Keys keys = SecureChannel.derive(secret, transcript, client);
+        return new Session(device, challengeS, challengeC,
+                new DataInputStream(SecureChannel.input(in, keys.receive())),
+                new DataOutputStream(SecureChannel.output(out, keys.send())));
     }
 
     /** Result of {@link #pair}: the device now trusted and the code both screens must show. */
@@ -207,6 +238,12 @@ public final class FileTransferService implements AutoCloseable {
     private volatile ServerSocket server;
     private volatile boolean running;
     private volatile java.util.function.Predicate<InetAddress> pushFilter = address -> true;
+    private volatile SendListener sendListener = (file, to, device, encrypted) -> { };
+
+    /** Observes files peers pulled from this node. */
+    public void setSendListener(SendListener listener) {
+        this.sendListener = listener == null ? (file, to, device, encrypted) -> { } : listener;
+    }
 
     /**
      * Decides which senders may push documents to this node (default: everyone). Addresses are only as trustworthy
@@ -223,7 +260,7 @@ public final class FileTransferService implements AutoCloseable {
         this(store, security, null, port, maxFileBytes, listener);
     }
 
-    /** Zero-trust mode (protocol v2): device keys, trusted-peers list, access lists, pairing. */
+    /** Zero-trust mode (protocol v3): device keys, trusted-peers list, access lists, pairing, AES-GCM tunnel. */
     public FileTransferService(ContentStore store, ZeroTrust trust, int port, long maxFileBytes, Listener listener) {
         this(store, LanSecurity.open(), Objects.requireNonNull(trust, "trust must not be null"), port, maxFileBytes,
                 listener);
@@ -398,31 +435,46 @@ public final class FileTransferService implements AutoCloseable {
             }
             byte[] clientKey = readBlob(in, DeviceIdentity.MAX_PUBLIC_KEY_BYTES);
             byte[] challengeC = readExact(in, CHALLENGE_BYTES);
+            byte[] ephC = readBlob(in, MAX_EPHEMERAL_BYTES);
             byte[] signature = readExact(in, DeviceIdentity.SIGNATURE_BYTES);
             Optional<TrustStore.Device> device = trust.trust().authenticate(clientKey);
             if (device.isEmpty()) {
                 denied(socket, DeviceIdentity.fingerprintOf(clientKey), "device is not paired");
                 return;
             }
-            if (!DeviceIdentity.verify(clientKey, signature, LABEL_CLIENT, challengeS, challengeC)) {
+            if (!DeviceIdentity.verify(clientKey, signature, LABEL_CLIENT, challengeS, challengeC, ephC)) {
                 denied(socket, device.get().fingerprint(), "invalid challenge signature");
                 return;
             }
-            writeBlob(out, trust.identity().publicKey());
-            out.write(trust.identity().sign(LABEL_SERVER, challengeS, challengeC, clientKey));
+            java.security.KeyPair eph = SecureChannel.ephemeral();
+            byte[] secret;
+            try {
+                secret = SecureChannel.agree(eph, ephC);
+            } catch (java.security.GeneralSecurityException e) {
+                denied(socket, device.get().fingerprint(), "invalid ephemeral key");
+                return;
+            }
+            byte[] ephS = eph.getPublic().getEncoded();
+            byte[] serverKey = trust.identity().publicKey();
+            writeBlob(out, serverKey);
+            writeBlob(out, ephS);
+            out.write(trust.identity().sign(LABEL_SERVER, challengeS, challengeC, clientKey, ephC, ephS));
             out.flush();
-            request = readBlob(in, MAX_REQUEST_BYTES);
-            byte[] requestSignature = readExact(in, DeviceIdentity.SIGNATURE_BYTES);
+            session = tunnel(device.get(), challengeS, challengeC, secret,
+                    DeviceIdentity.transcript(challengeS, challengeC, clientKey, serverKey, ephC, ephS), false, in, out);
+            request = readBlob(session.in(), MAX_REQUEST_BYTES);
+            byte[] requestSignature = readExact(session.in(), DeviceIdentity.SIGNATURE_BYTES);
             if (!DeviceIdentity.verify(clientKey, requestSignature, LABEL_REQUEST, challengeS, challengeC, request)) {
                 denied(socket, device.get().fingerprint(), "invalid request signature");
                 return;
             }
-            session = new Session(device.get(), challengeS, challengeC);
         } catch (EOFException | SocketException e) {
             LOG.log(System.Logger.Level.DEBUG, "Handshake with {0} ended: {1}", socket.getInetAddress(), e.getMessage());
             return;
         }
         socket.setSoTimeout(IO_TIMEOUT_MILLIS);
+        in = session.in();
+        out = session.out();
         DataInputStream req = new DataInputStream(new ByteArrayInputStream(request));
         int op = req.readUnsignedByte();
         switch (op) {
@@ -644,11 +696,24 @@ public final class FileTransferService implements AutoCloseable {
                     LanConsole.success("One-shot transfer of " + file.name() + " to guest " + session.device().name()
                             + " completed and verified; the grant is used up and the session is closed");
                 }
+                if (verdict == OK) {
+                    notifySent(file, socket.getInetAddress(), session.device().name(), true);
+                }
+            } else {
+                notifySent(file, socket.getInetAddress(), null, false);
             }
         } finally {
             if (grant != null) {
                 oneShotInFlight.remove(grant);
             }
+        }
+    }
+
+    private void notifySent(StoredFile file, InetAddress to, String device, boolean encrypted) {
+        try {
+            sendListener.sent(file, to, device, encrypted);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.DEBUG, "Send listener failed: {0}", e.getMessage());
         }
     }
 
@@ -674,6 +739,8 @@ public final class FileTransferService implements AutoCloseable {
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), BLOCK));
             if (trust != null) {
                 Session session = authenticate(socket, in, out, expectedDevice);
+                in = session.in();
+                out = session.out();
                 ByteArrayOutputStream body = new ByteArrayOutputStream();
                 DataOutputStream req = new DataOutputStream(body);
                 req.writeByte(OP_PUT);
@@ -760,6 +827,8 @@ public final class FileTransferService implements AutoCloseable {
             long have = Files.exists(partial) ? Files.size(partial) : 0;
             if (trust != null) {
                 Session session = authenticate(socket, in, out, expectedDevice);
+                in = session.in();
+                out = session.out();
                 ByteArrayOutputStream body = new ByteArrayOutputStream();
                 DataOutputStream req = new DataOutputStream(body);
                 req.writeByte(OP_GET);
@@ -839,6 +908,8 @@ public final class FileTransferService implements AutoCloseable {
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), BLOCK));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), BLOCK));
             Session session = authenticate(socket, in, out, expectedDevice);
+            in = session.in();
+            out = session.out();
             sendRequest(out, session, new byte[]{(byte) OP_CATALOG});
             out.flush();
             int count = in.readInt();
@@ -937,17 +1008,22 @@ public final class FileTransferService implements AutoCloseable {
         byte[] challengeS = readHello(in);
         byte[] challengeC = LanSecurity.nonce(CHALLENGE_BYTES);
         byte[] ownKey = trust.identity().publicKey();
+        java.security.KeyPair eph = SecureChannel.ephemeral();
+        byte[] ephC = eph.getPublic().getEncoded();
         out.write(MAGIC);
         out.writeByte(VERSION_ZERO_TRUST);
         out.writeByte(KIND_AUTH);
         writeBlob(out, ownKey);
         out.write(challengeC);
-        out.write(trust.identity().sign(LABEL_CLIENT, challengeS, challengeC));
+        writeBlob(out, ephC);
+        out.write(trust.identity().sign(LABEL_CLIENT, challengeS, challengeC, ephC));
         out.flush();
         byte[] serverKey;
+        byte[] ephS;
         byte[] signature;
         try {
             serverKey = readBlob(in, DeviceIdentity.MAX_PUBLIC_KEY_BYTES);
+            ephS = readBlob(in, MAX_EPHEMERAL_BYTES);
             signature = readExact(in, DeviceIdentity.SIGNATURE_BYTES);
         } catch (EOFException | SocketException e) {
             throw new TransferException("Peer closed the connection during the handshake: this device ("
@@ -960,12 +1036,19 @@ public final class FileTransferService implements AutoCloseable {
             throw new TransferException("Peer identity mismatch: expected " + DeviceIdentity.display(expectedDevice)
                     + ", got " + DeviceIdentity.display(fingerprint) + " (" + server.name() + "); nothing was sent");
         }
-        if (!DeviceIdentity.verify(serverKey, signature, LABEL_SERVER, challengeS, challengeC, ownKey)) {
+        if (!DeviceIdentity.verify(serverKey, signature, LABEL_SERVER, challengeS, challengeC, ownKey, ephC, ephS)) {
             throw new TransferException("Peer " + server.name() + " failed the challenge (invalid signature); nothing"
                     + " was sent");
         }
+        byte[] secret;
+        try {
+            secret = SecureChannel.agree(eph, ephS);
+        } catch (java.security.GeneralSecurityException e) {
+            throw new TransferException("Peer " + server.name() + " sent an invalid session key; nothing was sent");
+        }
         socket.setSoTimeout(IO_TIMEOUT_MILLIS);
-        return new Session(server, challengeS, challengeC);
+        return tunnel(server, challengeS, challengeC, secret,
+                DeviceIdentity.transcript(challengeS, challengeC, ownKey, serverKey, ephC, ephS), true, in, out);
     }
 
     private void sendRequest(DataOutputStream out, Session session, byte[] request) throws IOException {
@@ -1220,7 +1303,11 @@ public final class FileTransferService implements AutoCloseable {
             throw new TransferException("Peer runs the legacy LAN mode (DWB_TRUST=legacy); this node is in zero-trust"
                     + " mode - both sides must use the same mode");
         }
-        if (version == VERSION_ZERO_TRUST && expected == VERSION) {
+        if (version == VERSION_ZERO_TRUST_PLAIN && expected == VERSION_ZERO_TRUST) {
+            throw new TransferException("Peer runs an older zero-trust build without the encrypted tunnel; update it"
+                    + " (both sides must speak protocol v" + VERSION_ZERO_TRUST + ")");
+        }
+        if ((version == VERSION_ZERO_TRUST || version == VERSION_ZERO_TRUST_PLAIN) && expected == VERSION) {
             throw new TransferException("Peer runs the zero-trust LAN mode; this node is in legacy mode"
                     + " (DWB_TRUST=legacy) - both sides must use the same mode");
         }

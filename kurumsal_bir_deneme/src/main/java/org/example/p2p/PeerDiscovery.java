@@ -609,7 +609,7 @@ public final class PeerDiscovery implements AutoCloseable {
         }
         if (trust.trust().authenticate(pk).isEmpty()) {
             if ("ANN".equals(f.get("t"))) {
-                trust.sighted(id, sanitize(f.get("name")), from.getAddress());
+                trust.sighted(id, sanitize(f.get("name")), from.getAddress(), (int) parseLong(f.get("tp"), 0));
             }
             return; // blind and deaf to devices that were never paired
         }

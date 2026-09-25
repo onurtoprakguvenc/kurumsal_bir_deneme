@@ -102,13 +102,13 @@ tasks.register('runLanTests', JavaExec) {
 }
 
 // Headless verification of zero-trust LAN mode: sealed device keys, challenge-response handshake, PIN pairing,
-// access lists, guest one-shot transfers, resume integrity and catalog isolation (loopback only).
+// access lists, guest one-shot transfers, resume integrity, catalog isolation and the AES-GCM tunnel (loopback only).
 tasks.register('runZeroTrustTests', JavaExec) {
     group = 'verification'
-    description = 'Runs the headless ZeroTrustTestRunner under a 512 MB heap.'
+    description = 'Runs the headless ZeroTrustTestRunner under the 300 MB heap ceiling of the encrypted tunnel.'
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'org.example.ZeroTrustTestRunner'
-    maxHeapSize = '512m'
+    maxHeapSize = '300m'
     jvmArgs += ['-Djava.awt.headless=true', '-XX:+UseSerialGC']
 }
 

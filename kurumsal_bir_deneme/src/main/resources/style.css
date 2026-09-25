@@ -832,6 +832,59 @@
     -fx-text-fill: #a99cff;
 }
 
+/* ----------------------------------------------------------------- LAN security (status bar, devices page) */
+
+.security-badge {
+    -fx-padding: 1 8 1 8;
+    -fx-background-radius: 9;
+    -fx-border-radius: 9;
+    -fx-border-width: 1;
+}
+
+.security-zero-trust {
+    -fx-text-fill: #7fe0a8;
+    -fx-background-color: #13261c;
+    -fx-border-color: #2a5c3f;
+}
+
+.security-legacy {
+    -fx-text-fill: #e6c07a;
+    -fx-background-color: #2a2212;
+    -fx-border-color: #5c4a22;
+}
+
+.security-open {
+    -fx-text-fill: #ff9d8a;
+    -fx-background-color: #2e1612;
+    -fx-border-color: #6b2c22;
+}
+
+.security-off {
+    -fx-text-fill: #8a8a96;
+    -fx-background-color: transparent;
+    -fx-border-color: #2c2c34;
+}
+
+.secure-transfer {
+    -fx-text-fill: #7fe0a8;
+}
+
+.secure-transfer.secure-transfer-plain {
+    -fx-text-fill: #e6c07a;
+}
+
+.pairing-code {
+    -fx-font-family: "JetBrains Mono", "Consolas", "Menlo", monospace;
+    -fx-font-size: 34px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #e8e6ff;
+    -fx-padding: 4 0 4 0;
+}
+
+.danger-button {
+    -fx-text-fill: #ff9d8a;
+}
+
 .status-clickable {
     -fx-cursor: hand;
 }

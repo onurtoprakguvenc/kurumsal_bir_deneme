@@ -287,6 +287,13 @@ public final class LanSyncService implements AutoCloseable {
          */
         default void transferFinished(String what, String peer, boolean verified) {
         }
+
+        /**
+         * Any transfer of any size finished and was verified: {@code outgoing} when a peer pulled from this node.
+         * {@code encrypted} is true for the zero-trust AES-GCM tunnel. Called on a transfer thread: never block.
+         */
+        default void transferCompleted(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+        }
     }
 
     /** Smaller downloads finish too quickly for progress reports to mean anything. */
@@ -484,9 +491,47 @@ public final class LanSyncService implements AutoCloseable {
     }
 
     private FileTransferService transferService(int port) {
-        return settings.trust() == null
+        FileTransferService t = settings.trust() == null
                 ? new FileTransferService(store, settings.security(), port, settings.maxFileBytes(), this::onPushed)
                 : new FileTransferService(store, settings.trust(), port, settings.maxFileBytes(), this::onPushed);
+        t.setSendListener((file, to, device, encrypted) -> completed(true, file.name(),
+                device != null ? device : to.getHostAddress(), file.size(), encrypted));
+        return t;
+    }
+
+    private void completed(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+        try {
+            listener.transferCompleted(outgoing, name, peer, bytes, encrypted);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.DEBUG, "Transfer listener failed: {0}", e.getMessage());
+        }
+    }
+
+    /** This computer's IPv4 LAN addresses (what another device enters to reach it). */
+    public static List<String> lanAddresses() {
+        return LanConsole.lanAddresses();
+    }
+
+    /** Cheap (no disk access): {@code zero-trust}, {@code authenticated (DWB_SECRET)} or {@code OPEN mode}. */
+    public String mode() {
+        return settings.mode();
+    }
+
+    /** Peers currently announcing themselves (cheap: no disk access, unlike {@link #status()}). */
+    public List<PeerInfo> peers() {
+        PeerDiscovery d = discovery;
+        return d == null ? List.of() : d.peers();
+    }
+
+    /** Whether transfers go through the zero-trust AES-GCM tunnel. */
+    public boolean encrypted() {
+        return settings.trust() != null;
+    }
+
+    /** The TCP transfer port while running, 0 otherwise. */
+    public int transferPort() {
+        FileTransferService t = transfer;
+        return t == null ? 0 : t.port();
     }
 
     public boolean running() {
@@ -700,6 +745,9 @@ public final class LanSyncService implements AutoCloseable {
                 try {
                     TransferResult result = transfer.pull(endpoint, peer.nodeId(), sha256, progress);
                     verified = true;
+                    if (result.outcome() == FileTransferService.Outcome.RECEIVED) {
+                        completed(false, result.file().name(), peer.name(), result.file().size(), encrypted());
+                    }
                     deliver(result.file(), peer.name());
                     return;
                 } catch (IOException e) {
@@ -727,6 +775,7 @@ public final class LanSyncService implements AutoCloseable {
         }
         String peer = discovery.peers().stream().filter(p -> p.address().equals(from)).map(PeerInfo::name)
                 .findFirst().orElse(from.getHostAddress());
+        completed(false, file.name(), peer, file.size(), encrypted());
         submit(() -> {
             try {
                 deliver(file, peer);

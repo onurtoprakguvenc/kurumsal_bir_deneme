@@ -223,6 +223,16 @@ public final class WorkbenchChassis implements AutoCloseable {
     private final HBox statusTransfer = new HBox(6, transferBar, transferLabel);
     private final Tooltip transferTip = new Tooltip();
     private final Timeline heapTicker = new Timeline(new KeyFrame(HEAP_TICK, e -> updateHeap()));
+    /** LAN security badge: zero-trust / legacy / off; click opens the device management page. */
+    private final Label statusSecurity = statusLabel();
+    private final Tooltip securityTip = new Tooltip();
+    /** Lock (or warning) for the last finished LAN transfer, shown for a few seconds. */
+    private final Label statusSecureTransfer = statusLabel();
+    private final Tooltip secureTransferTip = new Tooltip();
+    private final javafx.animation.PauseTransition secureTransferHide =
+            new javafx.animation.PauseTransition(javafx.util.Duration.seconds(8));
+    private final Timeline securityTicker = new Timeline(new KeyFrame(javafx.util.Duration.seconds(2),
+            e -> updateSecurityBadge()));
 
     // Toolbar (chrome) and the always-visible focus switch.
     private final MenuButton newMenu = new MenuButton("+ Yeni");
@@ -299,6 +309,11 @@ public final class WorkbenchChassis implements AutoCloseable {
             public void finished(String what, String peer, boolean verified) {
                 Fx.run(() -> endTransfer(what, verified));
             }
+
+            @Override
+            public void completed(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+                Fx.run(() -> showSecureTransfer(outgoing, name, peer, bytes, encrypted));
+            }
         });
     }
 
@@ -339,9 +354,23 @@ public final class WorkbenchChassis implements AutoCloseable {
         Tooltip.install(statusTransfer, transferTip);
         statusTransfer.setVisible(false);
         statusTransfer.setManaged(false);
-        statusBar.getChildren().addAll(guideButton, statusProject, statusDocs, statusMode, spacer, statusTransfer,
-                statusMessage);
+        statusSecurity.getStyleClass().addAll("security-badge", "status-clickable");
+        statusSecurity.setOnMouseClicked(e -> showAdminPanel(true));
+        Tooltip.install(statusSecurity, securityTip);
+        statusSecureTransfer.getStyleClass().add("secure-transfer");
+        Tooltip.install(statusSecureTransfer, secureTransferTip);
+        statusSecureTransfer.setVisible(false);
+        statusSecureTransfer.setManaged(false);
+        secureTransferHide.setOnFinished(e -> {
+            statusSecureTransfer.setVisible(false);
+            statusSecureTransfer.setManaged(false);
+        });
+        statusBar.getChildren().addAll(guideButton, statusProject, statusDocs, statusMode, spacer, statusSecureTransfer,
+                statusTransfer, statusSecurity, statusMessage);
         heapTicker.setCycleCount(Animation.INDEFINITE);
+        securityTicker.setCycleCount(Animation.INDEFINITE);
+        updateSecurityBadge();
+        securityTicker.play();
 
         root.setTop(commandBar);
         root.setCenter(center);
@@ -437,7 +466,7 @@ public final class WorkbenchChassis implements AutoCloseable {
         projectMenu.getItems().add(new MenuItem("…")); // a Menu with no items never opens its submenu
         moreMenu.getItems().setAll(saveItem, projectMenu, new SeparatorMenuItem(),
                 menuItem("Klavye Kısayolları…", this::showShortcutManager),
-                menuItem("Yönetim ve Tanılama…", this::showAdminPanel),
+                menuItem("Yönetim ve Tanılama…", () -> showAdminPanel(false)),
                 menuItem("Komut Rehberi  (F1)", this::showCommandGuide));
         moreMenu.setTooltip(new Tooltip("Diğer işlemler"));
         moreMenu.setOnShowing(e -> rebuildProjectMenu());
@@ -2131,14 +2160,79 @@ public final class WorkbenchChassis implements AutoCloseable {
      * so access control, central-policy locks, audit entries and secret redaction stay where the admin engine
      * enforces them.
      */
-    private void showAdminPanel() {
+    private void showAdminPanel(boolean devices) {
         WorkbenchController c = controller;
         if (c == null) {
             return;
         }
         AdminPanelDialog dialog = styled(new AdminPanelDialog(ext, c, line -> runCommand(c, line),
                 path -> c.revealPath(path).thenAccept(this::reportUnaudited)));
+        if (devices) {
+            dialog.showDevices();
+        }
         dialog.show();
+    }
+
+    // ================================================================== LAN security indicators
+
+    /** FX thread: the badge for the current LAN security mode (cheap snapshot, polled every 2 s). */
+    private void updateSecurityBadge() {
+        ExtendedWorkbenchController.LanShield shield = ext.lanShield();
+        statusSecurity.getStyleClass().removeAll("security-zero-trust", "security-legacy", "security-open",
+                "security-off");
+        switch (shield.kind()) {
+            case ZERO_TRUST -> {
+                statusSecurity.setText("🔒 Zero-Trust aktif [v3 şifreli]");
+                statusSecurity.getStyleClass().add("security-zero-trust");
+                securityTip.setText("Sıfır güven modu · protokol v3\n"
+                        + "Cihaz kimliği (Ed25519): " + org.example.p2p.DeviceIdentity.display(shield.fingerprint()) + "\n"
+                        + "Tünel: X25519 + HKDF-SHA256 + AES-256-GCM (her oturumda yeni anahtar)\n"
+                        + "Dosya bütünlüğü: SHA-256 · güvenilen cihaz: " + shield.trusted() + " · TCP " + shield.transferPort()
+                        + "\nTıklayın: cihaz yönetimi");
+            }
+            case LEGACY_SECRET -> {
+                statusSecurity.setText("Legacy Mod · DWB_SECRET (şifresiz)");
+                statusSecurity.getStyleClass().add("security-legacy");
+                securityTip.setText("Eski protokol v1: eşler ortak sırla doğrulanır, aktarım şifrelenmez.\n"
+                        + "Sıfır güven için DWB_TRUST=legacy ayarını kaldırın.");
+            }
+            case LEGACY_OPEN -> {
+                statusSecurity.setText("⚠ Legacy Mod · açık (şifresiz)");
+                statusSecurity.getStyleClass().add("security-open");
+                securityTip.setText("Eski protokol v1, kimlik doğrulamasız: ağdaki herkes belgeleri görebilir.\n"
+                        + "Sıfır güven için DWB_TRUST=legacy ayarını kaldırın.");
+            }
+            case STARTING -> {
+                statusSecurity.setText("LAN başlatılıyor…");
+                statusSecurity.getStyleClass().add("security-off");
+                securityTip.setText("Ağ eşitleme başlatılıyor");
+            }
+            case OFF -> {
+                statusSecurity.setText("LAN kapalı");
+                statusSecurity.getStyleClass().add("security-off");
+                securityTip.setText("Ağ eşitleme kapalı: " + shield.reason());
+            }
+        }
+    }
+
+    /** FX thread: a lock (encrypted tunnel) or warning (legacy, plain) for a finished transfer, for a few seconds. */
+    private void showSecureTransfer(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+        if (closed) {
+            return;
+        }
+        String arrow = outgoing ? "⇡ " + name + " → " + peer : "⇣ " + name + " ← " + peer;
+        statusSecureTransfer.setText((encrypted ? "🔒 " : "⚠ ") + arrow + (encrypted ? " · şifreli ✓" : " · şifresiz"));
+        statusSecureTransfer.getStyleClass().removeAll("secure-transfer-plain");
+        if (!encrypted) {
+            statusSecureTransfer.getStyleClass().add("secure-transfer-plain");
+        }
+        secureTransferTip.setText((outgoing ? "Gönderildi: " : "Alındı: ") + name + " (" + bytes + " bayt)\n"
+                + (encrypted ? "Uçtan uca şifreli tünel (AES-256-GCM), karşı cihaz kimliği doğrulandı,"
+                + " içerik SHA-256 ile doğrulandı." : "Legacy mod: içerik SHA-256 ile doğrulandı ama aktarım"
+                + " şifrelenmedi."));
+        statusSecureTransfer.setVisible(true);
+        statusSecureTransfer.setManaged(true);
+        secureTransferHide.playFromStart();
     }
 
     /**
@@ -2219,11 +2313,12 @@ public final class WorkbenchChassis implements AutoCloseable {
         }
         TransferState s = shown.getValue();
         transferBar.setProgress((double) s.transferred() / s.total());
-        String text = "LAN ⇣ " + describeTransfer(shown.getKey(), s)
+        boolean encrypted = ext.lanShield().encrypted();
+        String text = (encrypted ? "🔒 " : "") + "LAN ⇣ " + describeTransfer(shown.getKey(), s)
                 + (s.transferred() >= s.total() ? " · doğrulanıyor…" : "")
                 + (transfers.size() > 1 ? " (+" + (transfers.size() - 1) + ")" : "");
         transferLabel.setText(text);
-        transferTip.setText(tip.toString());
+        transferTip.setText(tip + (encrypted ? "\nŞifreli tünel: AES-256-GCM" : "\nLegacy mod: şifresiz aktarım"));
     }
 
     private static String describeTransfer(String what, TransferState s) {
@@ -2243,6 +2338,8 @@ public final class WorkbenchChassis implements AutoCloseable {
         }
         closed = true;
         heapTicker.stop();
+        securityTicker.stop();
+        secureTransferHide.stop();
         if (commandGuide != null) {
             commandGuide.close();
         }

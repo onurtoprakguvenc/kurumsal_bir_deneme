@@ -241,6 +241,24 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
         }
         lanSettings = settings;
         lanOff = lanSwitchedOn() ? null : "switched off on this computer (lan --on)";
+        if (settings.trust() != null) {
+            // Pairings with this device's PIN, whether the PIN came from the terminal or the admin panel.
+            settings.trust().onPairing(new ZeroTrust.PairingListener() {
+                @Override
+                public void paired(TrustStore.Device device, String code) {
+                    admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-paired", "device", device.fingerprint(),
+                            "name", device.name(), "role", device.role().name());
+                    ExtendedWorkbenchController.this.notify(Severity.INFO, "Yeni cihaz eşleşti: " + device.name()
+                            + " · doğrulama kodu " + code + " (yeni cihazdaki kodla aynı olmalı)");
+                }
+
+                @Override
+                public void failed(String reason) {
+                    admin.audit().record(Level.WARN, Category.ADMIN, "op", "lan-pair-failed", "msg", reason);
+                    ExtendedWorkbenchController.this.notify(Severity.WARNING, "Eşleştirme başarısız: " + reason);
+                }
+            });
+        }
     }
 
     /** The running sync of the active project, if any. */
@@ -353,6 +371,15 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
             public void transferFinished(String what, String peer, boolean verified) {
                 transfers.finished(what, peer, verified);
             }
+
+            @Override
+            public void transferCompleted(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+                if (outgoing) {
+                    admin.audit().record(Level.INFO, Category.FILE_ACCESS, "op", "lan-send", "file", name, "peer", peer,
+                            "bytes", String.valueOf(bytes), "channel", encrypted ? "aes-256-gcm" : "plain");
+                }
+                transfers.completed(outgoing, name, peer, bytes, encrypted);
+            }
         };
     }
 
@@ -376,6 +403,13 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
 
         /** The download is over (verified and delivered, or broken off); the indicator goes away. */
         void finished(String what, String peer, boolean verified);
+
+        /**
+         * A transfer of any size finished and was verified, in either direction; {@code encrypted} when it went through
+         * the zero-trust AES-GCM tunnel.
+         */
+        default void completed(boolean outgoing, String name, String peer, long bytes, boolean encrypted) {
+        }
     }
 
     private volatile TransferObserver transfers = TransferObserver.NONE;
@@ -717,36 +751,231 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
                 Set.of("grant", "revoke"), (inv, out) -> cmdLanAcl(c, inv, out)));
     }
 
-    // ------------------------------------------------------------------ zero-trust LAN commands
+    // ------------------------------------------------------------------ zero-trust LAN: API (terminal and GUI)
+
+    /** What the status bar shows about LAN security. */
+    public enum LanShieldKind { OFF, STARTING, ZERO_TRUST, LEGACY_SECRET, LEGACY_OPEN }
+
+    /**
+     * Cheap snapshot of the LAN security state (no disk or network access; safe to poll from the FX thread).
+     *
+     * @param fingerprint this device's fingerprint in zero-trust mode, empty otherwise
+     * @param trusted     number of trusted devices (zero-trust mode)
+     * @param reason      why LAN sync is off, when it is
+     */
+    public record LanShield(LanShieldKind kind, String fingerprint, int trusted, int transferPort, String reason) {
+        public boolean encrypted() {
+            return kind == LanShieldKind.ZERO_TRUST;
+        }
+    }
+
+    public LanShield lanShield() {
+        LanSyncService.Settings settings = lanSettings;
+        LanSyncService s = lan;
+        ZeroTrust z = settings == null ? null : settings.trust();
+        String fp = z == null ? "" : z.identity().fingerprint();
+        int trusted = z == null ? 0 : z.trust().devices().size();
+        if (settings == null || lanOff != null || s == null) {
+            return new LanShield(LanShieldKind.OFF, fp, trusted, 0, lanOff == null ? "not started" : lanOff);
+        }
+        if (!s.running()) {
+            return new LanShield(LanShieldKind.STARTING, fp, trusted, 0, "");
+        }
+        LanShieldKind kind = z != null ? LanShieldKind.ZERO_TRUST
+                : settings.security().enabled() ? LanShieldKind.LEGACY_SECRET : LanShieldKind.LEGACY_OPEN;
+        return new LanShield(kind, fp, trusted, s.transferPort(), "");
+    }
+
+    /** The zero-trust context when LAN sync is configured in zero-trust mode (running or not). */
+    public Optional<ZeroTrust> zeroTrust() {
+        LanSyncService.Settings settings = lanSettings;
+        return Optional.ofNullable(settings == null ? null : settings.trust());
+    }
+
+    private ZeroTrust requireZeroTrust() {
+        return zeroTrust().orElseThrow(() -> new IllegalArgumentException(lanSettings == null
+                ? "LAN sync is " + lanOff
+                : "LAN sync runs in legacy mode (DWB_TRUST=legacy); pairing, devices and access lists exist only in"
+                + " zero-trust mode"));
+    }
 
     private LanSyncService zeroTrustLan() {
+        requireZeroTrust();
         LanSyncService s = lan;
         if (s == null || !s.running()) {
             throw new IllegalArgumentException("LAN sync is " + (s == null ? "off - " + lanOff : "starting…"));
         }
-        if (s.zeroTrust().isEmpty()) {
-            throw new IllegalArgumentException("LAN sync runs in legacy mode (DWB_TRUST=legacy); pairing, devices and"
-                    + " access lists exist only in zero-trust mode");
-        }
         return s;
     }
 
-    private void cmdLanPair(Invocation inv, Output out) throws IOException {
+    /** Operation names of the admin-locked LAN actions (as audited and shown in denials). */
+    public static final String PRIV_LAN_PAIR = "lan-pair --new";
+    public static final String PRIV_LAN_REVOKE = "lan-devices --remove";
+
+    /**
+     * Opens a 5-minute, one-attempt pairing PIN on this device (LAN sync must be running to accept it). Admin-locked:
+     * with an admin passphrase (or deployment token) configured, the admin session must be unlocked.
+     */
+    public ZeroTrust.PairingTicket lanOpenPairing(DeviceRole role, String department)
+            throws AdminControlEngine.PrivilegeException {
+        zeroTrustLan();
+        admin.requirePrivilege(PRIV_LAN_PAIR);
+        ZeroTrust.PairingTicket ticket = requireZeroTrust().openPairing(role, department);
+        admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-pair-open", "role", role.name(),
+                "department", ticket.department());
+        return ticket;
+    }
+
+    public void lanCancelPairing() {
+        requireZeroTrust().cancelPairing();
+    }
+
+    /**
+     * Pairs with a device showing a PIN ({@code peer}: discovered name or fingerprint prefix, or {@code host:port}).
+     * Blocking (network): never on the FX thread.
+     */
+    public FileTransferService.PairingResult lanJoin(String peer, String pin) throws IOException {
         LanSyncService s = zeroTrustLan();
-        ZeroTrust z = s.zeroTrust().orElseThrow();
+        java.net.InetSocketAddress endpoint = s.endpoint(peer.strip()).orElseThrow(() ->
+                new IllegalArgumentException("unknown peer '" + peer + "'; use host:port (an unpaired device does not"
+                        + " appear among the peers)"));
+        FileTransferService.PairingResult r = s.pair(endpoint, pin.strip());
+        admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-paired", "device", r.device().fingerprint(),
+                "name", r.device().name());
+        return r;
+    }
+
+    /** Pairing outcomes against this device's PIN (for the PIN dialog); run the returned action to unsubscribe. */
+    public Runnable onLanPairing(ZeroTrust.PairingListener listener) {
+        return requireZeroTrust().onPairing(listener);
+    }
+
+    public List<TrustStore.Device> lanDevices() {
+        return zeroTrust().map(z -> z.trust().devices()).orElse(List.of());
+    }
+
+    public List<ZeroTrust.Sighting> lanUnpaired() {
+        return zeroTrust().map(ZeroTrust::unpaired).orElse(List.of());
+    }
+
+    /** Whether a trusted device currently announces itself on the network. */
+    public boolean lanOnline(String fingerprint) {
+        LanSyncService s = lan;
+        return s != null && s.running() && s.peers().stream().anyMatch(p -> p.nodeId().equals(fingerprint));
+    }
+
+    public TrustStore.Device lanSetRole(String device, DeviceRole role) throws IOException {
+        ZeroTrust z = requireZeroTrust();
+        TrustStore.Device d = device(z.trust(), device);
+        TrustStore.Device changed = z.trust().setRole(d.fingerprint(), role);
+        admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-role", "device", d.fingerprint(), "role", role.name());
+        lanCatalogChanged();
+        return changed;
+    }
+
+    public TrustStore.Device lanSetDepartment(String device, String department) throws IOException {
+        ZeroTrust z = requireZeroTrust();
+        TrustStore.Device d = device(z.trust(), device);
+        TrustStore.Device changed = z.trust().setDepartment(d.fingerprint(), department);
+        admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-department", "device", d.fingerprint(),
+                "department", changed.department());
+        lanCatalogChanged();
+        return changed;
+    }
+
+    /**
+     * Removes a device from the trust list (and from every access list of the active project). Admin-locked like
+     * {@link #lanOpenPairing}.
+     */
+    public TrustStore.Device lanRevoke(String device) throws IOException, AdminControlEngine.PrivilegeException {
+        ZeroTrust z = requireZeroTrust();
+        TrustStore.Device d = device(z.trust(), device);
+        admin.requirePrivilege(PRIV_LAN_REVOKE);
+        LanSyncService s = lan;
+        z.forget(d.fingerprint(), s == null ? null : s.store());
+        admin.audit().record(Level.WARN, Category.ADMIN, "op", "lan-unpair", "device", d.fingerprint());
+        lanCatalogChanged();
+        return d;
+    }
+
+    /**
+     * Undoes a pairing made moments ago because the two verification codes differed (someone was in between). Needs no
+     * admin session, so a suspected interception can always be cut off at once, but it only accepts a device added
+     * within the pairing window ({@link ZeroTrust#PAIRING_TTL}); established devices are removed with the admin-locked
+     * {@link #lanRevoke}.
+     */
+    public TrustStore.Device lanRejectPairing(String fingerprint) throws IOException {
+        ZeroTrust z = requireZeroTrust();
+        TrustStore.Device d = z.trust().find(fingerprint).orElseThrow(() ->
+                new IllegalArgumentException("not a trusted device: " + fingerprint));
+        if (d.added().isBefore(java.time.Instant.now().minus(ZeroTrust.PAIRING_TTL))) {
+            throw new IllegalArgumentException("only a pairing from the last 5 minutes can be rejected here; removing an"
+                    + " established device needs the admin session (Güvenden Çıkar)");
+        }
+        LanSyncService s = lan;
+        z.forget(d.fingerprint(), s == null ? null : s.store());
+        admin.audit().record(Level.SECURITY, Category.ADMIN, "op", "lan-pair-rejected", "device", d.fingerprint(),
+                "reason", "verification codes differed");
+        lanCatalogChanged();
+        return d;
+    }
+
+    /** Whether the admin-locked LAN actions can run now (no passphrase configured, or the session is unlocked). */
+    public boolean lanAdminUnlocked() {
+        return admin.unlocked();
+    }
+
+    /** Documents of the active project that have an access list, with readable entries. */
+    public java.util.Map<String, String> lanAccessLists() {
+        LanSyncService s = zeroTrustLan();
+        ZeroTrust z = requireZeroTrust();
+        java.util.Map<String, String> out = new java.util.LinkedHashMap<>();
+        s.store().acl().snapshot().forEach((sha, entries) -> out.put(sha, describe(z, entries)));
+        return out;
+    }
+
+    /**
+     * Grants ({@code grant}) or revokes one document ({@code sha256}) for a device or {@code dept:NAME}; guests get
+     * one-shot grants. Returns the document's entries afterwards, readable.
+     */
+    public String lanAcl(String sha256, String target, boolean grant) throws IOException {
+        LanSyncService s = zeroTrustLan();
+        ZeroTrust z = requireZeroTrust();
+        String entry = aclEntry(z, target);
+        if (grant) {
+            s.store().acl().grant(sha256, entry);
+        } else {
+            s.store().acl().revoke(sha256, entry.startsWith("once:") ? entry.substring(5) : entry);
+        }
+        admin.audit().record(Level.INFO, Category.ADMIN, "op", grant ? "lan-grant" : "lan-revoke", "sha256", sha256,
+                "entry", entry);
+        s.catalogChanged();
+        List<String> entries = s.store().acl().entries(sha256);
+        return entries.isEmpty() ? "" : describe(z, entries);
+    }
+
+    private void lanCatalogChanged() {
+        LanSyncService s = lan;
+        if (s != null && s.running()) {
+            s.catalogChanged();
+        }
+    }
+
+    // ------------------------------------------------------------------ zero-trust LAN: terminal commands
+
+    private void cmdLanPair(Invocation inv, Output out) throws IOException, AdminControlEngine.PrivilegeException {
         if (inv.has("new")) {
             DeviceRole role = inv.has("guest") ? DeviceRole.RESTRICTED_GUEST : DeviceRole.FULL_PEER;
-            ZeroTrust.PairingTicket ticket = z.openPairing(role, inv.option("dept", ""));
-            admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-pair-open", "role", role.name(),
-                    "department", ticket.department());
+            ZeroTrust.PairingTicket ticket = lanOpenPairing(role, inv.option("dept", ""));
             out.println("pairing PIN: " + ticket.pin() + "  (valid 5 minutes, one attempt; the new device joins as "
                     + "role=" + role + (ticket.department().isEmpty() ? "" : " department=" + ticket.department()) + ")");
-            out.println("on the new device: lan-pair <this computer's address>:" + s.status().transferPort() + " "
-                    + ticket.pin() + "   · this device: " + DeviceIdentity.display(z.identity().fingerprint()));
+            out.println("on the new device: lan-pair <this computer's address>:" + lanShield().transferPort() + " "
+                    + ticket.pin() + "   · this device: "
+                    + DeviceIdentity.display(requireZeroTrust().identity().fingerprint()));
             return;
         }
         if (inv.has("cancel")) {
-            z.cancelPairing();
+            lanCancelPairing();
             out.println("pairing window closed");
             return;
         }
@@ -754,51 +983,36 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
             throw new IllegalArgumentException("usage: lan-pair --new [--guest] [--dept NAME] | lan-pair <peer|host:port>"
                     + " <PIN> | lan-pair --cancel");
         }
-        java.net.InetSocketAddress endpoint = s.endpoint(inv.args().get(0)).orElseThrow(() ->
-                new IllegalArgumentException("unknown peer '" + inv.args().get(0) + "'; use host:port (an unpaired"
-                        + " device does not appear among the peers)"));
-        FileTransferService.PairingResult r = s.pair(endpoint, inv.args().get(1));
-        admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-paired", "device", r.device().fingerprint(),
-                "name", r.device().name());
+        FileTransferService.PairingResult r = lanJoin(inv.args().get(0), inv.args().get(1));
         out.println("paired with " + r.device().name() + " (" + DeviceIdentity.display(r.device().fingerprint())
                 + "), trusted as " + r.device().labels());
         out.println("verification code: " + r.verificationCode() + " - the other device must show the same code;"
                 + " if it does not, run lan-devices --remove " + r.device().fingerprint().substring(0, 12));
     }
 
-    private void cmdLanDevices(Invocation inv, Output out) throws IOException {
-        LanSyncService s = zeroTrustLan();
-        ZeroTrust z = s.zeroTrust().orElseThrow();
-        TrustStore trust = z.trust();
+    private void cmdLanDevices(Invocation inv, Output out) throws IOException, AdminControlEngine.PrivilegeException {
+        zeroTrustLan();
+        ZeroTrust z = requireZeroTrust();
         if (inv.has("remove")) {
-            TrustStore.Device d = device(trust, inv.option("remove", ""));
-            z.forget(d.fingerprint(), s.store());
-            admin.audit().record(Level.WARN, Category.ADMIN, "op", "lan-unpair", "device", d.fingerprint());
-            s.catalogChanged();
+            TrustStore.Device d = lanRevoke(inv.option("remove", ""));
             out.println("no longer trusted: " + d.name() + " (" + DeviceIdentity.display(d.fingerprint()) + ")");
             return;
         }
         if (inv.has("role")) {
-            TrustStore.Device d = device(trust, inv.option("role", ""));
             DeviceRole role = DeviceRole.parse(inv.args().isEmpty() ? "" : inv.args().getFirst()).orElseThrow(() ->
                     new IllegalArgumentException("role must be FULL_PEER or RESTRICTED_GUEST"));
-            TrustStore.Device changed = trust.setRole(d.fingerprint(), role);
-            admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-role", "device", d.fingerprint(), "role", role.name());
-            s.catalogChanged();
+            TrustStore.Device changed = lanSetRole(inv.option("role", ""), role);
             out.println(changed.name() + ": " + changed.labels());
             return;
         }
         if (inv.has("dept")) {
-            TrustStore.Device d = device(trust, inv.option("dept", ""));
-            TrustStore.Device changed = trust.setDepartment(d.fingerprint(), inv.args().isEmpty() ? "" : inv.args().getFirst());
-            admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-department", "device", d.fingerprint(),
-                    "department", changed.department());
-            s.catalogChanged();
+            TrustStore.Device changed = lanSetDepartment(inv.option("dept", ""),
+                    inv.args().isEmpty() ? "" : inv.args().getFirst());
             out.println(changed.name() + ": " + changed.labels());
             return;
         }
         if (inv.has("pending")) {
-            List<ZeroTrust.Sighting> seen = z.unpaired();
+            List<ZeroTrust.Sighting> seen = lanUnpaired();
             out.println(seen.isEmpty() ? "no unpaired device announced itself in the last 10 minutes"
                     : "unpaired devices (isolated until paired with lan-pair):");
             seen.forEach(p -> out.printf("  %-20s %s  %s", p.name(), DeviceIdentity.display(p.fingerprint()),
@@ -807,7 +1021,7 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
         }
         out.println("this device: " + DeviceIdentity.display(z.identity().fingerprint()) + "  ("
                 + z.identity().fingerprint() + ")");
-        List<TrustStore.Device> all = trust.devices();
+        List<TrustStore.Device> all = lanDevices();
         out.println(all.isEmpty() ? "no trusted devices yet: this node is isolated (lan-pair --new)"
                 : "trusted devices (" + all.size() + "):");
         for (TrustStore.Device d : all) {
@@ -817,36 +1031,33 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
     }
 
     private void cmdLanAcl(WorkbenchController c, Invocation inv, Output out) throws IOException {
-        LanSyncService s = zeroTrustLan();
-        ZeroTrust z = s.zeroTrust().orElseThrow();
         if (inv.args().isEmpty()) {
-            java.util.Map<String, List<String>> all = s.store().acl().snapshot();
+            java.util.Map<String, String> all = lanAccessLists();
             out.println(all.isEmpty() ? "no access lists: every shared document is visible to every FULL_PEER"
                     : "documents with access lists:");
-            all.forEach((sha, entries) -> out.printf("  %s  %s", sha.substring(0, 12), describe(z, entries)));
+            all.forEach((sha, entries) -> out.printf("  %s  %s", sha.substring(0, 12), entries));
             return;
         }
-        String token = inv.joinedArgs();
-        String sha = c.workbench().resolve(token).map(org.example.model.DocumentRecord::sha256)
+        String sha = resolveContent(c, inv.joinedArgs());
+        String entries;
+        if (inv.has("grant")) {
+            entries = lanAcl(sha, inv.option("grant", ""), true);
+        } else if (inv.has("revoke")) {
+            entries = lanAcl(sha, inv.option("revoke", ""), false);
+        } else {
+            LanSyncService s = zeroTrustLan();
+            List<String> raw = s.store().acl().entries(sha);
+            entries = raw.isEmpty() ? "" : describe(requireZeroTrust(), raw);
+        }
+        out.println(sha.substring(0, 12) + ": " + (entries.isEmpty()
+                ? "no access list - visible to every FULL_PEER, to no guest" : entries));
+    }
+
+    /** A document or binary asset of the project by hash prefix or name. */
+    public static String resolveContent(WorkbenchController c, String token) {
+        return c.workbench().resolve(token).map(org.example.model.DocumentRecord::sha256)
                 .or(() -> c.resolveAsset(token).map(org.example.model.BinaryAsset::sha256))
                 .orElseThrow(() -> new IllegalArgumentException("no unique document or asset matches '" + token + "'"));
-        if (inv.has("grant")) {
-            String entry = aclEntry(z, inv.option("grant", ""));
-            s.store().acl().grant(sha, entry);
-            admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-grant", "sha256", sha, "entry", entry);
-            s.catalogChanged();
-        } else if (inv.has("revoke")) {
-            String entry = aclEntry(z, inv.option("revoke", ""));
-            if (entry.startsWith("once:")) {
-                entry = entry.substring(5);
-            }
-            s.store().acl().revoke(sha, entry);
-            admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-revoke", "sha256", sha, "entry", entry);
-            s.catalogChanged();
-        }
-        List<String> entries = s.store().acl().entries(sha);
-        out.println(sha.substring(0, 12) + ": " + (entries.isEmpty()
-                ? "no access list - visible to every FULL_PEER, to no guest" : describe(z, entries)));
     }
 
     /** A trusted device, or {@code dept:NAME}, as an access-list entry (guests always get one-shot grants). */
