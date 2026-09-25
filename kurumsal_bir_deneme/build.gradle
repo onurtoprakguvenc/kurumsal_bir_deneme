@@ -1,20 +1,219 @@
 plugins {
     id 'java'
+    id 'application'
 }
 
 group = 'org.example'
 version = '1.0-SNAPSHOT'
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
 repositories {
     mavenCentral()
 }
 
+// İşletim sistemine uygun yerel JavaFX paketini belirle
+def currentOs = org.gradle.internal.os.OperatingSystem.current()
+def fxPlatform = currentOs.isWindows() ? 'win' : (currentOs.isMacOsX() ? 'mac' : 'linux')
+
 dependencies {
-    testImplementation platform('org.junit:junit-bom:6.0.0')
+    // JavaFX 21 Kütüphaneleri (Doğrudan Maven Central'dan)
+    implementation "org.openjfx:javafx-base:21.0.2:${fxPlatform}"
+    implementation "org.openjfx:javafx-graphics:21.0.2:${fxPlatform}"
+    implementation "org.openjfx:javafx-controls:21.0.2:${fxPlatform}"
+
+    // Apache PDFBox 3 (PDF Desteği)
+    implementation 'org.apache.pdfbox:pdfbox:3.0.3'
+
+    // DOCX / XLSX / PPTX / PPT / CSV okuyucuları yalnızca JDK kullanır (ZipFile + StAX); Apache POI,
+    // commons-compress, xmlbeans ve log4j kodda hiç kullanılmadığı için kaldırıldı.
+
+    // Test
+    testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+application {
+    // Plain launcher for org.example.ui.WorkbenchApp (JavaFX on the classpath, not the module path).
+    mainClass = 'org.example.ui.Launcher'
+    // Low-end target (4 GB machines): hard 512 MB heap cap, the lean serial collector.
+    applicationDefaultJvmArgs = ['-Xmx512m', '-XX:+UseSerialGC']
+}
+
+tasks.withType(JavaExec).configureEach {
+    jvmArgs += [
+            '-Dfile.encoding=UTF-8'
+    ]
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
 test {
     useJUnitPlatform()
+}
+
+// Headless verification of storage, terminal, view modes, key bindings and OS actions (no JavaFX toolkit).
+tasks.register('runTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headless workbench TestRunner under a 512 MB heap.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.example.TestRunner'
+    maxHeapSize = '512m'
+    jvmArgs += ['-Djava.awt.headless=true']
+}
+
+// Headless verification of preview, focus mode, admin policy, web bridge and project switching.
+tasks.register('runExtendedTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headless ExtendedTestRunner (features 6-10) under a 512 MB heap.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.example.ExtendedTestRunner'
+    maxHeapSize = '512m'
+    jvmArgs += ['-Djava.awt.headless=true']
+}
+
+// Headless verification of the UI action pipelines (untrack/purge, clipboard, context actions, mode picker, shortcut
+// manager) plus a regression sweep over all 10 specifications and heap compliance.
+tasks.register('runSystemTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headless SystemVerificationTestRunner under a 512 MB heap.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.example.SystemVerificationTestRunner'
+    maxHeapSize = '512m'
+    jvmArgs += ['-Djava.awt.headless=true', '-XX:+UseSerialGC']
+}
+
+// Headless verification of LAN sync (discovery parsing, SHA-256 verified transfer, multi-node ingestion over loopback
+// seeds) and single/batch inverted-index eviction.
+tasks.register('runLanTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headless LanSyncTestRunner under a 512 MB heap.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.example.LanSyncTestRunner'
+    maxHeapSize = '512m'
+    jvmArgs += ['-Djava.awt.headless=true', '-XX:+UseSerialGC']
+}
+
+// Headless verification of zero-trust LAN mode: sealed device keys, challenge-response handshake, PIN pairing,
+// access lists, guest one-shot transfers, resume integrity and catalog isolation (loopback only).
+tasks.register('runZeroTrustTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headless ZeroTrustTestRunner under a 512 MB heap.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.example.ZeroTrustTestRunner'
+    maxHeapSize = '512m'
+    jvmArgs += ['-Djava.awt.headless=true', '-XX:+UseSerialGC']
+}
+
+// ============================================================================================ packaging
+//
+//   gradlew packageApp        self-contained folder build/jpackage/DocumentWorkbench (no Java install needed;
+//                             needs nothing but the JDK). Copy it anywhere and run DocumentWorkbench.exe.
+//   gradlew packageInstaller  Windows .msi (build/jpackage/*.msi) for IT deployment; needs the WiX Toolset 3.x
+//                             (candle.exe / light.exe on PATH): https://wixtoolset.org
+//   -PperUser=true            the .msi installs for the current user only, without administrator rights.
+//
+// Both bundle a trimmed Java 21 runtime and bake in the settings the application is designed for (512 MB heap,
+// serial GC, UTF-8), so nobody can start it with the wrong memory setting. A second launcher, dwb-cli.exe, runs the
+// console node (LAN sharing, --hash-passphrase for the central IT policy).
+
+def appVersion = '1.0.0'
+def appName = 'DocumentWorkbench'
+def jpackageDir = layout.buildDirectory.dir('jpackage')
+def jvmSettings = ['-Xmx512m', '-XX:+UseSerialGC', '-Dfile.encoding=UTF-8', "-Ddwb.version=${appVersion}"]
+// java.desktop: Desktop/AWT integration · java.net.http: Gemini and web search · jdk.charsets: windows-1254 text
+// files · jdk.localedata: Turkish number and date formats · jdk.unsupported: JavaFX · jdk.crypto.ec: TLS
+def runtimeModules = 'java.base,java.desktop,java.logging,java.management,java.naming,java.net.http,java.xml,' +
+        'java.prefs,jdk.charsets,jdk.localedata,jdk.unsupported,jdk.crypto.ec,jdk.zipfs'
+
+jar {
+    manifest {
+        attributes('Implementation-Title': appName, 'Implementation-Version': appVersion)
+    }
+}
+
+def jpackageTool = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }.map {
+    it.metadata.installationPath.file(currentOs.isWindows() ? 'bin/jpackage.exe' : 'bin/jpackage').asFile
+}
+
+tasks.register('jpackageInput', Sync) {
+    group = 'distribution'
+    description = 'Collects the application jar and its runtime libraries for jpackage.'
+    from(tasks.named('jar'))
+    from(configurations.runtimeClasspath)
+    into(jpackageDir.map { it.dir('input') })
+}
+
+def cliLauncherFile = layout.buildDirectory.file('jpackage/dwb-cli.properties')
+
+tasks.register('jpackageLauncherConfig') {
+    description = 'Writes the dwb-cli console launcher definition.'
+    outputs.file(cliLauncherFile)
+    doLast {
+        def f = cliLauncherFile.get().asFile
+        f.parentFile.mkdirs()
+        f.text = "main-class=org.example.App\n" +
+                "java-options=${jvmSettings.join(' ')}\n" +
+                "win-console=true\n"
+    }
+}
+
+def jpackageArgs = { String type ->
+    def args = ['--type', type,
+                '--name', appName,
+                '--app-version', appVersion,
+                '--vendor', 'Document Workbench',
+                '--description', 'Belge Tezgahi - yerel belge arama',
+                '--input', jpackageDir.get().dir('input').asFile.absolutePath,
+                '--main-jar', tasks.named('jar').get().archiveFileName.get(),
+                '--main-class', 'org.example.ui.Launcher',
+                '--add-modules', runtimeModules,
+                '--jlink-options', '--strip-debug --no-header-files --no-man-pages',
+                '--add-launcher', "dwb-cli=${cliLauncherFile.get().asFile.absolutePath}",
+                '--dest', jpackageDir.get().asFile.absolutePath]
+    jvmSettings.each { args += ['--java-options', it] }
+    return args
+}
+
+tasks.register('packageApp', Exec) {
+    group = 'distribution'
+    description = 'Builds a self-contained application folder with its own Java runtime (build/jpackage/DocumentWorkbench).'
+    dependsOn 'jpackageInput', 'jpackageLauncherConfig'
+    doFirst {
+        delete jpackageDir.get().dir(appName)
+        executable = jpackageTool.get().absolutePath
+        args = jpackageArgs('app-image')
+    }
+}
+
+tasks.register('packageInstaller', Exec) {
+    group = 'distribution'
+    description = 'Builds a Windows .msi installer (needs WiX Toolset 3.x on PATH).'
+    dependsOn 'jpackageInput', 'jpackageLauncherConfig'
+    doFirst {
+        if (!currentOs.isWindows()) {
+            throw new GradleException('packageInstaller builds a Windows .msi and must run on Windows.')
+        }
+        def onPath = { String exe ->
+            System.getenv('PATH').split(File.pathSeparator).any { new File(it, exe).isFile() }
+        }
+        if (!onPath('candle.exe') || !onPath('light.exe')) {
+            throw new GradleException('The WiX Toolset 3.x is required for .msi files (candle.exe and light.exe on ' +
+                    'PATH): https://wixtoolset.org  - or build the portable folder with: gradlew packageApp')
+        }
+        def extra = ['--win-menu', '--win-menu-group', 'Document Workbench', '--win-shortcut',
+                     '--win-dir-chooser', '--win-upgrade-uuid', '6f1d3c2a-5b7e-4a61-9c1f-2d8e4b7a9c30']
+        if (project.findProperty('perUser') == 'true') {
+            extra += ['--win-per-user-install']
+        }
+        executable = jpackageTool.get().absolutePath
+        args = jpackageArgs('msi') + extra
+    }
 }
