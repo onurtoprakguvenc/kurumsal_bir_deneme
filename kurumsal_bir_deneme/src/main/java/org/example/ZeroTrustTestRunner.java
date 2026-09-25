@@ -671,6 +671,29 @@ public final class ZeroTrustTestRunner {
             check("denials are recorded in the audit log", ext.admin().audit().tail(50).stream()
                     .anyMatch(l -> l.contains("SECURITY") && l.contains("lan-pair --new") && l.contains("denied")), "");
 
+            // Privilege escalation paths: role, department, access lists.
+            String roleDenied = privilegeError(() -> ext.lanSetRole("Eski-Laptop", DeviceRole.RESTRICTED_GUEST));
+            check("a locked session cannot change a device's role", roleDenied.contains("admin unlock")
+                    && trust.trust().find(veteran.fingerprint()).orElseThrow().role() == DeviceRole.FULL_PEER, roleDenied);
+            trust.trust().setRole(veteran.fingerprint(), DeviceRole.RESTRICTED_GUEST);
+            String escalate = privilegeError(() -> ext.lanSetRole("Eski-Laptop", DeviceRole.FULL_PEER));
+            check("in particular a guest cannot be raised to FULL_PEER", escalate.contains("admin unlock")
+                    && trust.trust().find(veteran.fingerprint()).orElseThrow().guest(), escalate);
+            InternalTerminalEngine.Outcome roleViaTerminal = ext.terminal()
+                    .execute("lan-devices --role Eski-Laptop FULL_PEER");
+            check("lan-devices --role is locked too", !roleViaTerminal.succeeded()
+                    && trust.trust().find(veteran.fingerprint()).orElseThrow().guest(), roleViaTerminal.toString());
+            String deptDenied = privilegeError(() -> ext.lanSetDepartment("Eski-Laptop", "FINANCE"));
+            InternalTerminalEngine.Outcome deptViaTerminal = ext.terminal().execute("lan-devices --dept Eski-Laptop HR");
+            check("a locked session cannot change a department (controller and terminal)", deptDenied.contains(
+                    "admin unlock") && !deptViaTerminal.succeeded()
+                    && trust.trust().find(veteran.fingerprint()).orElseThrow().department().isEmpty(), deptDenied);
+            String secretDoc = "c".repeat(64);
+            String grantDenied = privilegeError(() -> ext.lanAcl(secretDoc, "Eski-Laptop", true));
+            String deptGrantDenied = privilegeError(() -> ext.lanAcl(secretDoc, "dept:FINANCE", true));
+            check("a locked session cannot grant access to a document", grantDenied.contains("admin unlock")
+                    && deptGrantDenied.contains("admin unlock") && ext.lanAccessLists().isEmpty(), grantDenied);
+
             ext.lanRejectPairing(colleague.fingerprint());
             check("rejecting a pairing made moments ago (codes differed) works without the admin session",
                     !trust.trust().trusted(colleague.fingerprint()), "");
@@ -689,6 +712,21 @@ public final class ZeroTrustTestRunner {
                     instanceof AdminControlEngine.UnlockResult.Unlocked && ext.lanAdminUnlocked(), "");
             ZeroTrust.PairingTicket ticket = ext.lanOpenPairing(DeviceRole.RESTRICTED_GUEST, "");
             check("unlocked: a pairing PIN opens", ticket.pin().matches("\\d{6}") && trust.pendingPairing().isPresent(), "");
+            ext.lanSetRole("Eski-Laptop", DeviceRole.FULL_PEER);
+            ext.lanSetDepartment("Eski-Laptop", "finance");
+            TrustStore.Device changed = trust.trust().find(veteran.fingerprint()).orElseThrow();
+            check("unlocked: role and department change", changed.role() == DeviceRole.FULL_PEER
+                    && changed.department().equals("FINANCE"), changed.labels());
+            ext.lanAcl(secretDoc, "dept:FINANCE", true);
+            check("unlocked: an access list is granted", ext.lanAccessLists().getOrDefault(secretDoc, "")
+                    .contains("dept:FINANCE"), ext.lanAccessLists().toString());
+            ext.admin().lock();
+            String revokeAclDenied = privilegeError(() -> ext.lanAcl(secretDoc, "dept:FINANCE", false));
+            check("locked again: revoking an access-list entry is refused (it would widen visibility)",
+                    revokeAclDenied.contains("admin unlock") && ext.lanAccessLists().containsKey(secretDoc), revokeAclDenied);
+            ext.admin().unlock(token.toCharArray());
+            ext.lanAcl(secretDoc, "dept:FINANCE", false);
+            check("unlocked: the access-list entry is revoked", ext.lanAccessLists().isEmpty(), "");
             ext.lanRevoke("Eski-Laptop");
             check("unlocked: an established device is revoked", !trust.trust().trusted(veteran.fingerprint()), "");
             ext.admin().lock();

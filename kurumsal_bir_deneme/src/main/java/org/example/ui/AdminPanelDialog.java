@@ -83,6 +83,7 @@ final class AdminPanelDialog extends Dialog<Void> {
 
         TrustedDevicesPane devices = new TrustedDevicesPane(ext, controller, this::child);
         refreshers.add(devices::refresh);
+        addEventHandler(javafx.scene.control.DialogEvent.DIALOG_HIDDEN, e -> devices.dispose());
         devicesTab = tab("Cihazlar", devices);
         tabs = new TabPane(
                 tab("Genel", overview()),

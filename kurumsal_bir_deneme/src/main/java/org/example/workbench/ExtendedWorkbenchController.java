@@ -811,6 +811,10 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
     /** Operation names of the admin-locked LAN actions (as audited and shown in denials). */
     public static final String PRIV_LAN_PAIR = "lan-pair --new";
     public static final String PRIV_LAN_REVOKE = "lan-devices --remove";
+    public static final String PRIV_LAN_ROLE = "lan-devices --role";
+    public static final String PRIV_LAN_DEPARTMENT = "lan-devices --dept";
+    public static final String PRIV_LAN_GRANT = "lan-acl --grant";
+    public static final String PRIV_LAN_ACL_REVOKE = "lan-acl --revoke";
 
     /**
      * Opens a 5-minute, one-attempt pairing PIN on this device (LAN sync must be running to accept it). Admin-locked:
@@ -864,18 +868,27 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
         return s != null && s.running() && s.peers().stream().anyMatch(p -> p.nodeId().equals(fingerprint));
     }
 
-    public TrustStore.Device lanSetRole(String device, DeviceRole role) throws IOException {
+    /**
+     * Changes a trusted device's role. Admin-locked: turning a guest into a full peer widens what it can see, so it
+     * needs the same unlocked admin session as pairing.
+     */
+    public TrustStore.Device lanSetRole(String device, DeviceRole role)
+            throws IOException, AdminControlEngine.PrivilegeException {
         ZeroTrust z = requireZeroTrust();
         TrustStore.Device d = device(z.trust(), device);
+        admin.requirePrivilege(PRIV_LAN_ROLE);
         TrustStore.Device changed = z.trust().setRole(d.fingerprint(), role);
         admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-role", "device", d.fingerprint(), "role", role.name());
         lanCatalogChanged();
         return changed;
     }
 
-    public TrustStore.Device lanSetDepartment(String device, String department) throws IOException {
+    /** Changes a trusted device's department (department grants follow it). Admin-locked. */
+    public TrustStore.Device lanSetDepartment(String device, String department)
+            throws IOException, AdminControlEngine.PrivilegeException {
         ZeroTrust z = requireZeroTrust();
         TrustStore.Device d = device(z.trust(), device);
+        admin.requirePrivilege(PRIV_LAN_DEPARTMENT);
         TrustStore.Device changed = z.trust().setDepartment(d.fingerprint(), department);
         admin.audit().record(Level.INFO, Category.ADMIN, "op", "lan-department", "device", d.fingerprint(),
                 "department", changed.department());
@@ -936,11 +949,14 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
 
     /**
      * Grants ({@code grant}) or revokes one document ({@code sha256}) for a device or {@code dept:NAME}; guests get
-     * one-shot grants. Returns the document's entries afterwards, readable.
+     * one-shot grants. Returns the document's entries afterwards, readable. Admin-locked (both directions: revoking
+     * the last entry of a restricted document makes it visible to every full peer again).
      */
-    public String lanAcl(String sha256, String target, boolean grant) throws IOException {
+    public String lanAcl(String sha256, String target, boolean grant)
+            throws IOException, AdminControlEngine.PrivilegeException {
         LanSyncService s = zeroTrustLan();
         ZeroTrust z = requireZeroTrust();
+        admin.requirePrivilege(grant ? PRIV_LAN_GRANT : PRIV_LAN_ACL_REVOKE);
         String entry = aclEntry(z, target);
         if (grant) {
             s.store().acl().grant(sha256, entry);
@@ -1030,7 +1046,8 @@ public final class ExtendedWorkbenchController implements AutoCloseable {
         z.pendingPairing().ifPresent(tk -> out.println("pairing window open until " + tk.expires() + " (" + tk.role() + ")"));
     }
 
-    private void cmdLanAcl(WorkbenchController c, Invocation inv, Output out) throws IOException {
+    private void cmdLanAcl(WorkbenchController c, Invocation inv, Output out)
+            throws IOException, AdminControlEngine.PrivilegeException {
         if (inv.args().isEmpty()) {
             java.util.Map<String, String> all = lanAccessLists();
             out.println(all.isEmpty() ? "no access lists: every shared document is visible to every FULL_PEER"

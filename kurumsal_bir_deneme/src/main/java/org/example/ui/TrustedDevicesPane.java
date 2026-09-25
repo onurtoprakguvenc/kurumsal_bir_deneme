@@ -79,6 +79,13 @@ final class TrustedDevicesPane extends VBox {
     private final VBox managed = new VBox(10);
     private final Label adminState = label("admin-status");
     private Button pairButton;
+    /** Access-list inputs: read-only while the admin session is locked. */
+    private final List<javafx.scene.Node> aclControls = new java.util.ArrayList<>();
+    private final Button lockButton = button("🔓 Kilidi Aç", this::toggleLock);
+    /** The admin session expires on its own; the editable state follows it. */
+    private final javafx.animation.Timeline lockTicker = new javafx.animation.Timeline(
+            new javafx.animation.KeyFrame(javafx.util.Duration.seconds(2), e -> applyLock(false)));
+    private Boolean shownUnlocked;
 
     /**
      * @param style applies the application's stylesheet and owner to a child dialog
@@ -129,6 +136,7 @@ final class TrustedDevicesPane extends VBox {
         aclTarget.setPrefWidth(200);
         Button grant = button("İzin ver", () -> acl(document.getText(), true));
         Button revoke = button("İzni kaldır", () -> acl(document.getText(), false));
+        aclControls.addAll(List.of(document, aclTarget, grant, revoke));
         accessLists.getStyleClass().add("admin-list");
         accessLists.setPrefHeight(110);
         accessLists.setPlaceholder(new Label("Erişim listesi yok: paylaşılan her belgeyi tüm FULL_PEER cihazlar görür"));
@@ -140,15 +148,64 @@ final class TrustedDevicesPane extends VBox {
                         + " doğrulama kodu aynı olmalıdır."),
                 section("GÜVENİLEN CİHAZLAR"), devices,
                 note("Rol ve departman doğrudan tabloda değiştirilir (departman: yazıp Enter). “Güvenden Çıkar” cihazı"
-                        + " anında yalıtır ve tüm erişim listelerinden siler. Eşleştirme ve güvenden çıkarma yönetici"
-                        + " oturumu ister; kilit kapalıyken parola sorulur."),
+                        + " anında yalıtır ve tüm erişim listelerinden siler. Eşleştirme, güvenden çıkarma, rol,"
+                        + " departman ve erişim listeleri yönetici oturumu ister: kilit kapalıyken tablo ve erişim"
+                        + " listesi salt okunurdur."),
                 section("AĞDA GÖRÜLEN EŞLEŞTİRİLMEMİŞ CİHAZLAR"), unpaired,
                 section("BELGE ERİŞİM LİSTELERİ"), new HBox(8, document, aclTarget, grant, revoke), accessLists,
                 note("Listesi olan belgeyi yalnızca listedeki cihazlar/departmanlar görür ve çekebilir. Misafire verilen"
                         + " izin tek seferliktir."));
         getChildren().setAll(section("BU CİHAZ"), identity, state,
-                new HBox(8, button("Yenile", this::refresh)), managed, message);
+                new HBox(8, button("Yenile", this::refresh), lockButton), managed, message);
         refresh();
+        lockTicker.setCycleCount(javafx.animation.Animation.INDEFINITE);
+        lockTicker.play();
+    }
+
+    /** Stops the lock watcher (the window closed). */
+    void dispose() {
+        lockTicker.stop();
+    }
+
+    // ================================================================== admin lock
+
+    /**
+     * Makes role, department and access-list editing read-only while the admin session is locked (and editable when
+     * it is open), and relabels the locked actions. Only re-renders when the state changed, unless {@code force}.
+     * The controller checks the session on every change anyway; this keeps the screen honest about it.
+     */
+    private void applyLock(boolean force) {
+        boolean unlocked = ext.lanAdminUnlocked();
+        if (!force && Boolean.valueOf(unlocked).equals(shownUnlocked)) {
+            return;
+        }
+        shownUnlocked = unlocked;
+        boolean lockable = ext.admin().protectedMode();
+        pairButton.setText(unlocked ? PAIR_LABEL : "🔒 " + PAIR_LABEL);
+        aclControls.forEach(n -> n.setDisable(!unlocked));
+        lockButton.setText(unlocked ? "🔒 Kilitle" : "🔓 Kilidi Aç");
+        lockButton.setVisible(lockable);
+        lockButton.setManaged(lockable);
+        adminState.setText(!lockable
+                ? "⚠ Yönetici parolası tanımlı değil: eşleştirme, güvenden çıkarma, rol/departman ve erişim listeleri bu"
+                + " bilgisayarı kullanan herkese açık. Parolayı merkezi politikada (admin.passphrase.hash) ya da"
+                + " “admin passwd” ile tanımlayın."
+                : unlocked ? "🔓 Yönetici oturumu açık: eşleştirme, güvenden çıkarma, rol, departman ve erişim listeleri"
+                + " düzenlenebilir"
+                : "🔒 Yönetici kilidi kapalı: rol, departman ve erişim listeleri salt okunur; eşleştirme ve güvenden"
+                + " çıkarma yönetici parolası ister");
+        devices.refresh(); // re-renders the role and department cells with the new state
+    }
+
+    private void toggleLock() {
+        if (ext.lanAdminUnlocked()) {
+            ext.admin().lock();
+            message.setText("Yönetici oturumu kilitlendi.");
+            applyLock(true);
+            return;
+        }
+        withAdmin("cihaz ve erişim ayarlarını düzenlemek", () -> message.setText("Yönetici oturumu açık."));
+        applyLock(true);
     }
 
     // ================================================================== refresh
@@ -168,14 +225,8 @@ final class TrustedDevicesPane extends VBox {
             case OFF -> "LAN eşitleme kapalı: " + shield.reason();
         });
         managed.setDisable(!zeroTrust || shield.kind() != LanShieldKind.ZERO_TRUST);
-        boolean unlocked = ext.lanAdminUnlocked();
-        pairButton.setText(unlocked ? PAIR_LABEL : "🔒 " + PAIR_LABEL);
-        adminState.setText(!ext.admin().protectedMode()
-                ? "⚠ Yönetici parolası tanımlı değil: eşleştirme ve güvenden çıkarma bu bilgisayarı kullanan herkese"
-                + " açık. Parolayı merkezi politikada (admin.passphrase.hash) ya da “admin passwd” ile tanımlayın."
-                : unlocked ? "🔓 Yönetici oturumu açık: eşleştirme ve güvenden çıkarma kullanılabilir"
-                : "🔒 Yönetici kilidi kapalı: “Yeni Cihaz Eşleştir” ve “Güvenden Çıkar” yönetici parolası ister");
         devices.getItems().setAll(ext.lanDevices());
+        applyLock(true);
         unpaired.getItems().setAll(ext.lanUnpaired().stream().map(s -> s.name() + "  ·  "
                 + DeviceIdentity.display(s.fingerprint()) + "  ·  "
                 + (s.transferPort() > 0 ? s.endpoint() : s.address().getHostAddress())).toList());
@@ -339,6 +390,7 @@ final class TrustedDevicesPane extends VBox {
                     return;
                 }
                 box.setValue(d.role());
+                box.setDisable(!ext.lanAdminUnlocked());
                 setGraphic(box);
             }
         });
@@ -379,6 +431,7 @@ final class TrustedDevicesPane extends VBox {
                     return;
                 }
                 field.setText(d.department());
+                field.setDisable(!ext.lanAdminUnlocked());
                 setGraphic(field);
             }
         });

@@ -135,8 +135,11 @@ değiştirilir, “Güvenden Çıkar” tek tık) ve belge erişim listeleri. Du
 (“🔒 Zero-Trust aktif [v3 şifreli]” / “Legacy Mod”); tıklanınca bu sekme açılır. Biten her aktarım durum çubuğunda
 kilitle (şifreli) ya da uyarıyla (legacy, şifresiz) birkaç saniye gösterilir.
 
-**Yönetici kilidi:** “Yeni Cihaz Eşleştir” (`lan-pair --new`) ve “Güvenden Çıkar” (`lan-devices --remove`) yönetici
-oturumu ister; kilit kapalıysa buton 🔒 ile görünür ve tıklanınca yönetici parolası sorulur. Reddedilen denemeler
+**Yönetici kilidi:** “Yeni Cihaz Eşleştir” (`lan-pair --new`), “Güvenden Çıkar” (`lan-devices --remove`), rol ve
+departman değişiklikleri (`lan-devices --role/--dept`) ve belge erişim listeleri (`lan-acl --grant/--revoke`) yönetici
+oturumu ister. Kilit kapalıyken cihaz tablosundaki rol/departman alanları ve erişim listesi salt okunurdur; eşleştirme
+ve güvenden çıkarma butonları 🔒 ile görünür ve tıklanınca yönetici parolası sorulur (Cihazlar sekmesindeki
+“Kilidi Aç” da aynı işi görür). Oturum süresi dolunca alanlar kendiliğinden yeniden kilitlenir. Reddedilen denemeler
 denetim kaydına `SECURITY` olarak yazılır. Yönetici parolası (`admin.passphrase.hash`) ya da dağıtım anahtarı
 tanımlı değilse kilit de yoktur; kurumsal kurulumda parolayı merkezi politikada tanımlayın. İstisna: doğrulama
 kodları farklı çıktığında “Kodlar farklı — Güvenden çıkar” son 5 dakikada eşleşmiş cihazı kilitsiz geri alır
