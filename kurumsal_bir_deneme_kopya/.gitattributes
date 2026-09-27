@@ -1,0 +1,3 @@
+# Unix scripts must keep LF endings even with core.autocrlf=true, or bash fails on Linux
+*.sh text eol=lf
+gradlew text eol=lf

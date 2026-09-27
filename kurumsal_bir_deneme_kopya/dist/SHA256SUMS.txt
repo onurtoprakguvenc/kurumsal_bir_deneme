@@ -1,0 +1,2 @@
+d2cddd1909b6a7116098757d05767c8d6bdb93460f2ab6aac3e2c2eeee56dade  DocumentWorkbench-1.0.0-jars.zip
+e04f6f2fb05b2d3783a99846f002d0eee4a5ce362afeb09cdc3293ab58bbb6b8  DocumentWorkbench-1.0.0.exe
