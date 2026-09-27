@@ -548,6 +548,47 @@ public final class LanSyncService implements AutoCloseable {
         sweep();
     }
 
+    // ================================================================== secure push
+
+    /**
+     * Whether {@code peer} may be sent {@code sha256} from this node: only in zero-trust mode (the encrypted tunnel),
+     * and only when the access list would let that device pull the content itself — a push never widens who can
+     * see a document (a guest receives only what was granted to it).
+     */
+    public boolean canPush(PeerInfo peer, String sha256) {
+        FileTransferService t = transfer;
+        return running && t != null && settings.trust() != null && t.visibleTo(sha256, peer.nodeId());
+    }
+
+    /**
+     * Sends locally held content to a trusted, discovered peer through the AES-GCM tunnel, pinned to that device's
+     * fingerprint. Blocking (network): not on the FX thread. The receiver verifies SHA-256 before accepting it.
+     */
+    public TransferResult push(PeerInfo peer, String sha256) throws IOException {
+        Objects.requireNonNull(peer, "peer must not be null");
+        FileTransferService t = transfer;
+        if (!running || t == null) {
+            throw new FileTransferService.TransferException("LAN sync is not running");
+        }
+        if (!canPush(peer, sha256)) {
+            throw new FileTransferService.TransferException("the access list does not allow " + peer.name()
+                    + " to receive " + sha256.substring(0, 12));
+        }
+        InetSocketAddress endpoint = peer.transferEndpoint();
+        LanConsole.start("Pushing " + sha256.substring(0, 12) + " to " + peer.name() + " ("
+                + endpoint.getAddress().getHostAddress() + ":" + endpoint.getPort() + ")");
+        try {
+            TransferResult result = t.push(endpoint, peer.nodeId(), sha256, FileTransferService.Progress.NONE);
+            if (result.outcome() == FileTransferService.Outcome.SENT) {
+                completed(true, result.file().name(), peer.name(), result.bytes(), encrypted());
+            }
+            return result;
+        } catch (IOException e) {
+            LanConsole.failed(sha256.substring(0, 12) + " to " + peer.name() + ": " + LanConsole.reason(e));
+            throw e;
+        }
+    }
+
     // ================================================================== zero trust
 
     /** The zero-trust context, empty in legacy mode. */
@@ -671,13 +712,21 @@ public final class LanSyncService implements AutoCloseable {
     // ================================================================== remote side
 
     private boolean wanted(String sha256) {
+        if (!needed(sha256)) {
+            return false;
+        }
+        Long failed = failedAt.get(sha256);
+        return failed == null || System.currentTimeMillis() - failed > RETRY_AFTER.toMillis();
+    }
+
+    /** Not indexed, declined or unusable here: {@link #wanted} without the pull retry back-off. */
+    private boolean needed(String sha256) {
         if (!Hashing.isSha256Hex(sha256) || declined.contains(sha256) || unusable.contains(sha256)
                 || controller.document(sha256).isPresent()
                 || store.registeredKind(sha256).orElse(null) == ContentKind.BINARY) {
             return false; // indexed here already, or a binary asset this node already holds
         }
-        Long failed = failedAt.get(sha256);
-        return failed == null || System.currentTimeMillis() - failed > RETRY_AFTER.toMillis();
+        return true;
     }
 
     private void schedule(PeerInfo peer) {
@@ -770,7 +819,9 @@ public final class LanSyncService implements AutoCloseable {
 
     /** A dwb-cli peer pushed a document ({@code push}): deliver it like a fetched one. */
     private void onPushed(StoredFile file, InetAddress from) {
-        if (!running || !wanted(file.sha256()) || !queued.add(file.sha256())) {
+        // The back-off only spaces out pulls; content that was just pushed and verified costs nothing to deliver. (A
+        // pull that raced this push fails with "already running" and would otherwise drop it for RETRY_AFTER.)
+        if (!running || !needed(file.sha256()) || !queued.add(file.sha256())) {
             return;
         }
         String peer = discovery.peers().stream().filter(p -> p.address().equals(from)).map(PeerInfo::name)

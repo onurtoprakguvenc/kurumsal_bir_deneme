@@ -16,6 +16,7 @@ import javafx.scene.control.Button;
 import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.ChoiceDialog;
 import javafx.scene.control.CheckMenuItem;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
@@ -57,6 +58,9 @@ import org.example.input.KeyMapRegistry.KeyStroke;
 import org.example.model.BinaryAsset;
 import org.example.model.DocumentRecord;
 import org.example.model.SearchResult;
+import org.example.p2p.FileTransferService;
+import org.example.p2p.LanSyncService;
+import org.example.p2p.PeerInfo;
 import org.example.net.WebSearchBridge;
 import org.example.net.WebSearchBridge.HybridOutcome;
 import org.example.platform.ClipboardPort;
@@ -406,6 +410,7 @@ public final class WorkbenchChassis implements AutoCloseable {
             }
         });
         browser.setOnPlaceChanged(this::placeChanged);
+        browser.setOnSelectionChanged(this::updateItemStatus);
         // The chooser must stay modal to the main window even when the tree panel is undocked (focus mode) or hidden.
         fileTree.setOwnerFallback(stage);
         buildToolbar();
@@ -1540,8 +1545,14 @@ public final class WorkbenchChassis implements AutoCloseable {
         commandBar.setCrumbs(crumbs);
         commandBar.setNavigationEnabled(browser.canGoBack(), browser.canGoForward(), browser.canGoUp());
         fileTree.setCurrent(browser.currentFolder());
+        updateItemStatus();
+    }
+
+    /** "124 öğe · 3 dosya seçildi — 14.2 MB": the visible layer's size plus the live selection. */
+    private void updateItemStatus() {
         int items = browser.itemCount();
-        statusDocs.setText(items < 0 ? "" : items + " öğe");
+        String selection = browser.selectionSummary().describe();
+        statusDocs.setText(items < 0 ? "" : items + " öğe" + (selection.isEmpty() ? "" : "   ·   " + selection));
     }
 
     // ================================================================== preview
@@ -1663,6 +1674,127 @@ public final class WorkbenchChassis implements AutoCloseable {
             long total = d.charCount();
             toasts.post(Severity.INFO, String.format(Locale.ROOT, "%s: %,d karakter kopyalandı%s", d.fileName(),
                     chars, total > chars ? " (ilk " + chars + " / " + total + ")" : ""));
+        });
+    }
+
+    // ------------------------------------------------------------------ multi-selection actions
+
+    /** Explorer shows one file per window: a multi-selection reveals one file per distinct folder, at most this many. */
+    private static final int REVEAL_MAX_FOLDERS = 8;
+
+    private void revealAll(List<Path> files) {
+        Map<Path, Path> firstPerFolder = new LinkedHashMap<>();
+        for (Path f : files) {
+            Path abs = f.toAbsolutePath().normalize();
+            firstPerFolder.putIfAbsent(abs.getParent() == null ? abs : abs.getParent(), abs);
+        }
+        List<Path> shown = firstPerFolder.values().stream().limit(REVEAL_MAX_FOLDERS).toList();
+        withController(c -> shown.forEach(p -> c.revealPath(p).thenAccept(this::reportUnaudited)));
+        if (firstPerFolder.size() > shown.size()) {
+            toasts.post(Severity.INFO, "İlk " + shown.size() + " klasör gösterildi (seçim " + firstPerFolder.size()
+                    + " klasöre yayılıyor)");
+        }
+    }
+
+    private void copyPaths(List<Path> files) {
+        if (files.isEmpty()) {
+            return;
+        }
+        List<String> paths = files.stream().map(p -> p.toAbsolutePath().normalize().toString()).distinct().toList();
+        clipboard.putText(String.join(System.lineSeparator(), paths));
+        toasts.post(Severity.INFO, paths.size() + " yol panoya kopyalandı");
+    }
+
+    /** Whether "Güvenli Gönder" can work: LAN sync running in zero-trust mode (the AES-GCM tunnel). */
+    private boolean canSendSecurely() {
+        return ext.lan().map(l -> l.running() && l.encrypted()).orElse(false);
+    }
+
+    private record Outgoing(String sha256, String name) {
+    }
+
+    /** A device in the "Güvenli Gönder" picker. */
+    private record PeerChoice(PeerInfo peer) {
+        @Override
+        public String toString() {
+            return peer.name() + "  ·  " + peer.address().getHostAddress();
+        }
+    }
+
+    /**
+     * "Güvenli Gönder": pick a trusted, online device, then push every item through the encrypted tunnel on a virtual
+     * thread. Only devices the access lists already allow are offered, and items a device may not see are skipped,
+     * so a push never widens who can read a document. One summary toast at the end.
+     */
+    private void sendSecurely(List<DocumentRecord> documents, List<BinaryAsset> assets) {
+        LanSyncService lan = ext.lan().filter(LanSyncService::running).orElse(null);
+        if (lan == null || !lan.encrypted()) {
+            toasts.post(Severity.WARNING, lan == null
+                    ? "Güvenli gönderim için LAN eşitlemesi açık olmalı"
+                    : "Güvenli gönderim yalnızca Zero Trust (şifreli tünel) modunda kullanılabilir");
+            return;
+        }
+        List<Outgoing> items = new ArrayList<>();
+        documents.forEach(d -> items.add(new Outgoing(d.sha256(), d.fileName())));
+        assets.forEach(a -> items.add(new Outgoing(a.sha256(), a.fileName())));
+        if (items.isEmpty()) {
+            return;
+        }
+        List<PeerChoice> targets = lan.peers().stream()
+                .filter(p -> items.stream().anyMatch(o -> lan.canPush(p, o.sha256())))
+                .map(PeerChoice::new).toList();
+        if (targets.isEmpty()) {
+            toasts.post(Severity.WARNING, "Seçilen öğeleri alabilecek çevrimiçi güvenilen cihaz yok"
+                    + " (erişim listelerini kontrol edin)");
+            return;
+        }
+        ChoiceDialog<PeerChoice> dialog = styled(new ChoiceDialog<>(targets.getFirst(), targets));
+        dialog.setTitle("Güvenli Gönder");
+        dialog.setHeaderText(items.size() == 1 ? "“" + items.getFirst().name() + "” hangi cihaza gönderilsin?"
+                : items.size() + " öğe hangi cihaza gönderilsin?");
+        dialog.setContentText("Cihaz:");
+        Optional<PeerChoice> choice = dialog.showAndWait();
+        if (choice.isEmpty()) {
+            return;
+        }
+        PeerInfo peer = choice.get().peer();
+        status("Gönderiliyor: " + items.size() + " öğe → " + peer.name() + "…");
+        Thread.ofVirtual().name("dwb-ui-send").start(() -> {
+            int sent = 0;
+            int present = 0;
+            int denied = 0;
+            List<String> failures = new ArrayList<>();
+            for (Outgoing o : items) {
+                if (!lan.canPush(peer, o.sha256())) {
+                    denied++;
+                    continue;
+                }
+                try {
+                    if (lan.push(peer, o.sha256()).outcome() == FileTransferService.Outcome.ALREADY_PRESENT) {
+                        present++;
+                    } else {
+                        sent++;
+                    }
+                } catch (IOException | RuntimeException e) {
+                    failures.add(o.name() + ": " + e.getMessage());
+                }
+            }
+            StringBuilder text = new StringBuilder("🔒 " + sent + " öğe " + peer.name() + " cihazına gönderildi");
+            if (present > 0) {
+                text.append(", ").append(present).append(" öğe zaten vardı");
+            }
+            if (denied > 0) {
+                text.append(", ").append(denied).append(" öğe erişim listesi nedeniyle atlandı");
+            }
+            if (!failures.isEmpty()) {
+                text.append(", ").append(failures.size()).append(" başarısız (").append(failures.getFirst()).append(')');
+            }
+            Severity severity = failures.isEmpty() ? Severity.INFO : Severity.WARNING;
+            String message = text.toString();
+            Fx.run(() -> {
+                status(message);
+                toasts.post(severity, message);
+            });
         });
     }
 
@@ -2554,6 +2686,26 @@ public final class WorkbenchChassis implements AutoCloseable {
         @Override
         public void untrackAsset(BinaryAsset asset) {
             WorkbenchChassis.this.untrackAsset(asset);
+        }
+
+        @Override
+        public void revealAll(List<Path> files) {
+            WorkbenchChassis.this.revealAll(files);
+        }
+
+        @Override
+        public void copyPaths(List<Path> files) {
+            WorkbenchChassis.this.copyPaths(files);
+        }
+
+        @Override
+        public void send(List<DocumentRecord> documents, List<BinaryAsset> assets) {
+            sendSecurely(documents, assets);
+        }
+
+        @Override
+        public boolean canSend() {
+            return canSendSecurely();
         }
     }
 }

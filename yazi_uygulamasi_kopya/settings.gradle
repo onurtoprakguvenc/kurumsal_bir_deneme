@@ -1,0 +1,11 @@
+rootProject.name = 'yazi_uygulamasi'
+
+include 'core-model'   // pure value types: buffer snapshot, spans, context window
+include 'core-text'    // deterministic text algorithms (no network, no dependencies)
+include 'gateway'      // the single model client: SSE streaming, structured JSON, cancellation
+include 'prose'        // general-purpose prose pipeline: continue, rewrite, ask
+include 'motion'       // video prompt engine: verbatim port of video_uretme_prompt
+include 'visual'       // image prompt compiler: ported from image_generate_prompt_improve
+include 'metaprompt'   // meta-prompt compiler: ported from prompt_gelistirme
+include 'desktop'      // JavaFX + RichTextFX editor
+include 'devtools'     // console smoke checks against the real API

@@ -1,0 +1,6 @@
+apply plugin: 'java-test-fixtures'   // ScriptedGateway: an offline ModelGateway for other modules' tests
+
+dependencies {
+    // api: callers annotate their structured-output records with Jackson annotations
+    api 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+}

@@ -1,0 +1,9 @@
+// The general-purpose prose pipeline: continue, rewrite, ask. Stateless; no UI, no fiction machinery.
+dependencies {
+    api project(':core-text')
+    api project(':gateway')
+}
+
+dependencies {
+    testImplementation testFixtures(project(':gateway'))
+}

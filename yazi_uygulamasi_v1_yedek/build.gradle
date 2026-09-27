@@ -1,0 +1,31 @@
+// Root project only aggregates the modules; all code lives in subprojects.
+// Gradle itself may run on any JDK >= 17; the bytecode always targets Java 21.
+
+subprojects {
+    apply plugin: 'java-library'
+
+    group = 'org.yazi'
+    version = '0.1.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:6.0.0')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.release = 21
+        options.encoding = 'UTF-8'
+        options.compilerArgs += ['-Xlint:all', '-Xlint:-serial', '-Xlint:-try']
+    }
+
+    // The daemon runs in Cp1254 (see gradle.properties); tests must still see UTF-8 as the default charset.
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        jvmArgs '-Dfile.encoding=UTF-8'
+    }
+}

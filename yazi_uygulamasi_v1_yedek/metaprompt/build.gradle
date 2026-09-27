@@ -1,0 +1,13 @@
+// Meta-prompt compiler, ported from prompt_gelistirme.
+// MetaPromptContracts holds the original records, stage prompts and schemas byte-for-byte (see PORTING.md);
+// placeholder normalisation and persona linting are enforced in Java.
+dependencies {
+    api project(':gateway')
+    testImplementation testFixtures(project(':gateway'))
+}
+
+// STAGE3_SYSTEM (verbatim) has trailing spaces inside its text block. javac strips them exactly as it did in
+// prompt_gelistirme, so the runtime string is unchanged; the lint note is silenced rather than editing the text.
+tasks.named('compileJava') {
+    options.compilerArgs += ['-Xlint:-text-blocks']
+}

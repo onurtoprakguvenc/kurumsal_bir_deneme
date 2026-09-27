@@ -1,0 +1,7 @@
+// Image prompt compiler, ported from image_generate_prompt_improve.
+// SceneContract, PromptCompiler and ThreeStageIngestor are verbatim (package line only; see PORTING.md).
+// VisualPipeline replaces VisualPromptApp's HTTP/CLI shell with a stateless pipeline on the shared gateway.
+dependencies {
+    api project(':gateway')
+    testImplementation testFixtures(project(':gateway'))
+}

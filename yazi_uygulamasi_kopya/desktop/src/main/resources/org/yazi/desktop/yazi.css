@@ -1,0 +1,476 @@
+/*
+ * Yazı: calm chrome, so the text is the only thing that draws the eye.
+ *
+ * Every colour is a named token on .root. The light theme is warm paper; .root.theme-dark redefines the same tokens
+ * as neutral graphite. Modena's own base colours (-fx-base, -fx-background, ...) are derived from the tokens, so
+ * standard controls, scroll bars and dialogs follow the theme without per-control rules.
+ */
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Tokens
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.root {
+    -yazi-paper: #fbfaf7;
+    -yazi-surface: #f3f1ec;
+    -yazi-card: #fffefc;
+    -yazi-ink: #1f2328;
+    -yazi-muted: #6b7079;
+    -yazi-faint: #9aa0a8;
+    -yazi-line: #e2dfd8;
+    -yazi-accent: #3a6ea5;
+    -yazi-accent-ink: #ffffff;
+    -yazi-accent-soft: #e1eaf5;
+    -yazi-ghost: #858b94;
+    -yazi-target: #a3a8b0;
+    -yazi-selection: #cfe0f5;
+    -yazi-ok: #3f8f5b;
+    -yazi-warn: #b7791f;
+    -yazi-danger: #b5473a;
+    -yazi-danger-soft: #fbecea;
+
+    -fx-base: #ebe8e2;
+    -fx-background: -yazi-surface;
+    -fx-control-inner-background: -yazi-card;
+    -fx-accent: -yazi-accent;
+    -fx-focus-color: -yazi-accent;
+    -fx-faint-focus-color: #3a6ea522;
+    -fx-font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    -fx-font-size: 13px;
+}
+
+.root.theme-dark {
+    -yazi-paper: #1c1d20;
+    -yazi-surface: #232428;
+    -yazi-card: #2a2c30;
+    -yazi-ink: #e6e3dc;
+    -yazi-muted: #a0a4ab;
+    -yazi-faint: #71767e;
+    -yazi-line: #36383d;
+    -yazi-accent: #7aa7d9;
+    -yazi-accent-ink: #14171b;
+    -yazi-accent-soft: #2c3a4a;
+    -yazi-ghost: #858b93;
+    -yazi-target: #6b7078;
+    -yazi-selection: #2f4a66;
+    -yazi-ok: #6cc08a;
+    -yazi-warn: #e0b25b;
+    -yazi-danger: #e0796b;
+    -yazi-danger-soft: #4a2c29;
+
+    -fx-base: #303236;
+    -fx-faint-focus-color: #7aa7d922;
+}
+
+/* Modena derives placeholder text by darkening the field, which vanishes on a dark field. */
+.text-input {
+    -fx-prompt-text-fill: -yazi-faint;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Window chrome
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.menu-bar {
+    -fx-background-color: -yazi-surface;
+    -fx-border-color: transparent transparent -yazi-line transparent;
+    -fx-padding: 2 6 2 6;
+}
+
+.menu-bar .label {
+    -fx-text-fill: -yazi-ink;
+}
+
+.split-pane {
+    -fx-background-color: -yazi-surface;
+    -fx-padding: 0;
+}
+
+.split-pane > .split-pane-divider {
+    -fx-background-color: -yazi-line;
+    -fx-padding: 0 0.5 0 0.5;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Editor
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.yazi-editor {
+    -fx-background-color: -yazi-paper;
+}
+
+.yazi-editor .text {
+    -fx-fill: -yazi-ink;
+}
+
+.yazi-editor .paragraph-text {
+    -fx-line-spacing: 5px;
+}
+
+.yazi-editor .caret {
+    -fx-stroke: -yazi-accent;
+    -fx-stroke-width: 1.6;
+}
+
+.yazi-editor .selection {
+    -fx-fill: -yazi-selection;
+}
+
+/* Model text that is not part of the document yet. */
+.yazi-editor .text.ai-ghost {
+    -fx-fill: -yazi-ghost;
+}
+
+/* Text a pending rewrite would replace. */
+.yazi-editor .text.ai-target {
+    -fx-fill: -yazi-target;
+    -fx-strikethrough: true;
+}
+
+.virtualized-scroll-pane {
+    -fx-background-color: -yazi-paper;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Bottom bars
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.command-bar, .find-bar {
+    -fx-background-color: -yazi-surface;
+    -fx-border-color: -yazi-line transparent transparent transparent;
+}
+
+.status-bar {
+    -fx-background-color: -yazi-surface;
+    -fx-border-color: -yazi-line transparent transparent transparent;
+}
+
+.status-bar .label {
+    -fx-font-size: 12px;
+}
+
+.status-message {
+    -fx-text-fill: -yazi-ink;
+}
+
+.status-bar .separator .line {
+    -fx-border-color: -yazi-line;
+    -fx-border-width: 0 0 0 1;
+}
+
+/* The small dot left of the status message: what the assistant is doing. */
+.status-dot {
+    -fx-min-width: 8px;
+    -fx-min-height: 8px;
+    -fx-max-width: 8px;
+    -fx-max-height: 8px;
+    -fx-background-radius: 4px;
+    -fx-background-color: -yazi-faint;
+}
+
+.status-dot.working {
+    -fx-background-color: -yazi-accent;
+}
+
+.status-dot.review {
+    -fx-background-color: -yazi-warn;
+}
+
+.status-dot.error {
+    -fx-background-color: -yazi-danger;
+}
+
+.status-dot.ready {
+    -fx-background-color: -yazi-ok;
+}
+
+.chip {
+    -fx-background-color: -yazi-card;
+    -fx-background-radius: 10px;
+    -fx-border-color: -yazi-line;
+    -fx-border-radius: 10px;
+    -fx-padding: 1 9 1 9;
+    -fx-text-fill: -yazi-muted;
+}
+
+.chip:hover {
+    -fx-text-fill: -yazi-ink;
+    -fx-border-color: -yazi-faint;
+}
+
+.usage-tooltip {
+    -fx-font-family: "Cascadia Mono", "Consolas", monospace;
+    -fx-font-size: 12px;
+}
+
+.instruction-field {
+    -fx-background-radius: 6px;
+    -fx-padding: 5 9 5 9;
+}
+
+/* Find bar: the query finds nothing. A quiet tint rather than an alarm. */
+.find-bar .text-field.no-match {
+    -fx-control-inner-background: -yazi-danger-soft;
+}
+
+.find-bar .find-button {
+    -fx-min-width: 28px;
+    -fx-padding: 2 6 2 6;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Buttons and segmented toggles
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.button, .toggle-button {
+    -fx-background-radius: 6px;
+}
+
+.button.primary {
+    -fx-background-color: -yazi-accent;
+    -fx-text-fill: -yazi-accent-ink;
+    -fx-font-weight: bold;
+}
+
+.button.primary:hover {
+    -fx-background-color: derive(-yazi-accent, 10%);
+}
+
+.button.primary:disabled {
+    -fx-opacity: 0.45;
+}
+
+.button.flat {
+    -fx-background-color: transparent;
+    -fx-text-fill: -yazi-muted;
+    -fx-padding: 2 7 2 7;
+}
+
+.button.flat:hover {
+    -fx-background-color: -yazi-accent-soft;
+    -fx-text-fill: -yazi-ink;
+}
+
+.segmented {
+    -fx-background-color: -yazi-line;
+    -fx-background-radius: 7px;
+    -fx-padding: 2px;
+    -fx-spacing: 2px;
+}
+
+.segmented .toggle-button {
+    -fx-background-color: transparent;
+    -fx-background-radius: 5px;
+    -fx-text-fill: -yazi-muted;
+    -fx-padding: 3 10 3 10;
+}
+
+.segmented .toggle-button:hover {
+    -fx-text-fill: -yazi-ink;
+}
+
+.segmented .toggle-button:selected {
+    -fx-background-color: -yazi-card;
+    -fx-text-fill: -yazi-ink;
+    -fx-effect: dropshadow(gaussian, #00000022, 3, 0, 0, 1);
+}
+
+.segmented .toggle-button:focused {
+    -fx-border-color: -yazi-accent;
+    -fx-border-radius: 5px;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Side panel
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.side-panel {
+    -fx-background-color: -yazi-surface;
+}
+
+.card {
+    -fx-background-color: -yazi-card;
+    -fx-background-radius: 8px;
+    -fx-border-color: -yazi-line;
+    -fx-border-radius: 8px;
+    -fx-padding: 10 12 10 12;
+}
+
+.section-title {
+    -fx-font-size: 11px;
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-muted;
+}
+
+.panel-heading {
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-ink;
+}
+
+.card .text-area {
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+
+.card .text-area .content,
+.card .text-area .scroll-pane,
+.card .text-area .scroll-pane .viewport {
+    -fx-background-color: transparent;
+}
+
+.card .text-area .content {
+    -fx-padding: 4 0 4 0;
+}
+
+.card .text-area:focused {
+    -fx-background-color: transparent;
+}
+
+.answer-area .content {
+    -fx-font-size: 13.5px;
+}
+
+.monospace, .monospace .content, .monospace .text {
+    -fx-font-family: "Cascadia Mono", "Consolas", monospace;
+    -fx-font-size: 12px;
+}
+
+.muted {
+    -fx-text-fill: -yazi-muted;
+}
+
+.warning {
+    -fx-text-fill: -yazi-warn;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Dialogs: the Compile studio, the stepper, the shortcut sheet
+ * ------------------------------------------------------------------------------------------------------------- */
+
+.dialog-pane {
+    -fx-background-color: -yazi-surface;
+}
+
+.dialog-pane > .button-bar > .container {
+    -fx-padding: 4 14 14 14;
+}
+
+.dialog-pane > .content {
+    -fx-padding: 0;
+}
+
+.studio-header {
+    -fx-background-color: -yazi-card;
+    -fx-border-color: transparent transparent -yazi-line transparent;
+    -fx-padding: 16 20 14 20;
+}
+
+.studio-glyph {
+    -fx-font-size: 26px;
+    -fx-text-fill: -yazi-accent;
+    -fx-min-width: 36px;
+    -fx-alignment: center;
+}
+
+.studio-title {
+    -fx-font-size: 17px;
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-ink;
+}
+
+.studio-subtitle {
+    -fx-text-fill: -yazi-muted;
+}
+
+.studio-body {
+    -fx-padding: 14 20 8 20;
+}
+
+.studio-section {
+    -fx-font-size: 11px;
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-muted;
+    -fx-padding: 8 0 0 0;
+}
+
+.studio-label {
+    -fx-text-fill: -yazi-ink;
+}
+
+.studio-hint {
+    -fx-text-fill: -yazi-muted;
+    -fx-font-size: 11.5px;
+}
+
+.studio-footer {
+    -fx-padding: 6 20 0 20;
+}
+
+.badge {
+    -fx-background-color: -yazi-accent-soft;
+    -fx-background-radius: 9px;
+    -fx-padding: 2 9 2 9;
+    -fx-text-fill: -yazi-accent;
+    -fx-font-size: 11.5px;
+    -fx-font-weight: bold;
+}
+
+.badge.local {
+    -fx-background-color: derive(-yazi-ok, 80%);
+    -fx-text-fill: derive(-yazi-ok, -25%);
+}
+
+.root.theme-dark .badge.local {
+    -fx-background-color: derive(-yazi-ok, -65%);
+    -fx-text-fill: -yazi-ok;
+}
+
+.validation {
+    -fx-font-size: 11.5px;
+    -fx-text-fill: -yazi-ok;
+}
+
+.validation.invalid {
+    -fx-text-fill: -yazi-danger;
+}
+
+.step {
+    -fx-text-fill: -yazi-faint;
+    -fx-font-size: 12px;
+}
+
+.step.done {
+    -fx-text-fill: -yazi-ok;
+}
+
+.step.active {
+    -fx-text-fill: -yazi-accent;
+    -fx-font-weight: bold;
+}
+
+.step-arrow {
+    -fx-text-fill: -yazi-faint;
+}
+
+.sheet-group {
+    -fx-font-size: 11px;
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-muted;
+    -fx-padding: 10 0 2 0;
+}
+
+.sheet-keys {
+    -fx-font-family: "Cascadia Mono", "Consolas", monospace;
+    -fx-font-size: 12px;
+    -fx-background-color: -yazi-card;
+    -fx-border-color: -yazi-line;
+    -fx-background-radius: 4px;
+    -fx-border-radius: 4px;
+    -fx-padding: 1 6 1 6;
+    -fx-text-fill: -yazi-ink;
+}
+
+.sheet-action {
+    -fx-text-fill: -yazi-ink;
+}

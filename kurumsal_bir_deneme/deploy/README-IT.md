@@ -22,6 +22,24 @@ Her iki çıktı da kendi Java'sını içerir; bilgisayarlara ayrıca Java kurul
 
 **Gereksinim:** 64-bit Windows 10 veya 11. (Windows 7/8.1 ve 32-bit Windows desteklenmez.)
 
+### Linux Mint / Ubuntu / Debian (x64)
+
+Linux paketi **Linux üzerinde** üretilir (jpackage başka işletim sistemi için paket üretemez):
+
+```
+sudo apt install openjdk-21-jdk openjdk-21-jmods fakeroot binutils    # derleme makinesinde bir kez
+bash build-linux.sh              → build/installer-linux/documentworkbench_1.0.0-1_amd64.deb
+                                   build/installer-linux/DocumentWorkbench-1.0.0-linux-x64.tar.gz
+bash build-linux.sh --no-deb     → yalnız taşınabilir .tar.gz
+```
+
+* `.deb`: `sudo apt install ./documentworkbench_1.0.0-1_amd64.deb` → `/opt/documentworkbench`, uygulama
+  menüsünde (Ofis) kısayol. GTK 3 ve OpenGL bağımlılıklarını apt kendisi kurar.
+* `.tar.gz`: kurulumsuz; açıp `DocumentWorkbench/bin/DocumentWorkbench` ile başlatılır.
+* Başlatıcılar: `DocumentWorkbench` (arayüz) ve `dwb-cli` (konsol düğümü), ikisi de `bin/` altında.
+* JVM ayarları Windows ile aynıdır (`-Xmx300m -Xms32m -XX:+UseG1GC`, UTF-8, Türkçe yerel verisi). Tek fark grafik
+  hattıdır: Direct3D yerine OpenGL (`-Dprism.order=es2`). Mesa sürücüsü olan her Mint kurulumunda çalışır.
+
 ## 2. Sessiz kurulum
 
 Yönetici olarak açılmış PowerShell'de:

@@ -3,14 +3,18 @@ package org.example.ui;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.geometry.Bounds;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.geometry.Side;
 import javafx.scene.Node;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ContextMenu;
+import javafx.scene.control.IndexedCell;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
+import javafx.scene.control.ScrollBar;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.SelectionMode;
 import javafx.scene.control.SeparatorMenuItem;
@@ -19,16 +23,20 @@ import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableRow;
 import javafx.scene.control.TableView;
 import javafx.scene.control.Tooltip;
+import javafx.scene.control.skin.VirtualFlow;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
+import javafx.scene.input.MouseEvent;
 import javafx.scene.input.TransferMode;
 import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.scene.shape.Rectangle;
 import org.example.model.BinaryAsset;
 import org.example.model.DocumentRecord;
 import org.example.model.DocumentType;
@@ -77,9 +85,13 @@ import java.util.function.Function;
  *
  * <p>Selection works like a native file manager: a click selects one row, {@code Shift+click} extends a contiguous
  * range from the anchor, {@code Ctrl+click} ({@code Cmd} on macOS) toggles single rows and {@code Ctrl+A} selects the
- * whole view. Right-clicking inside the selection keeps it, outside it selects that row only. With several documents
- * selected, "İndeksten Kaldır" / {@code Delete} and "Diskten Tamamen Sil…" / {@code Shift+Delete} act on all of them
- * at once; the other items act on the row that was clicked.</p>
+ * whole view. Dragging from the empty area below the rows draws a selection rectangle (see {@link RubberBand}).
+ * Right-clicking inside the selection keeps it, outside it selects that row only. With several rows selected,
+ * "İndeksten Kaldır" / {@code Delete} / {@code Ctrl+Backspace} ({@code Cmd+Backspace} on macOS) and "Diskten Tamamen
+ * Sil…" / {@code Shift+Delete} act on all selected documents at once, and "Klasörde Göster", "Yolu Kopyala" and
+ * "Güvenli Gönder…" cover every selected document and media file; open, preview and "İçeriği Kopyala" act on the row
+ * that was clicked. The trailing column holds the hover actions (preview, reveal, send, open, ⋯), and the status bar
+ * shows a {@link SelectionSummary}.</p>
  */
 public final class WorkspaceBrowserView extends StackPane {
 
@@ -170,6 +182,51 @@ public final class WorkspaceBrowserView extends StackPane {
         /** Stops sharing the asset and removes it from the list; the file on disk is not touched. */
         default void untrackAsset(BinaryAsset asset) {
         }
+
+        /** Shows every file of a multi-selection in the system file manager; defaults to nothing. */
+        default void revealAll(List<Path> files) {
+        }
+
+        /** Copies the paths of a multi-selection, one per line; defaults to nothing. */
+        default void copyPaths(List<Path> files) {
+        }
+
+        /** "Güvenli Gönder": pushes documents and assets to a trusted device over the encrypted LAN tunnel. */
+        default void send(List<DocumentRecord> documents, List<BinaryAsset> assets) {
+        }
+
+        /** Whether "Güvenli Gönder" can work right now (LAN sync running in zero-trust mode). */
+        default boolean canSend() {
+            return false;
+        }
+    }
+
+    /** What the visible table has selected, for the status bar ("3 dosya seçildi — 14.2 MB"). */
+    public record SelectionSummary(int files, int folders, long bytes) {
+        public static final SelectionSummary NONE = new SelectionSummary(0, 0, 0);
+
+        public boolean isEmpty() {
+            return files == 0 && folders == 0;
+        }
+
+        /** "3 dosya seçildi — 14.2 MB", "1 klasör seçildi", "2 dosya, 1 klasör seçildi — 3.0 MB"; empty for none. */
+        public String describe() {
+            if (isEmpty()) {
+                return "";
+            }
+            StringBuilder sb = new StringBuilder();
+            if (files > 0) {
+                sb.append(files).append(" dosya");
+            }
+            if (folders > 0) {
+                sb.append(sb.isEmpty() ? "" : ", ").append(folders).append(" klasör");
+            }
+            sb.append(" seçildi");
+            if (files > 0) {
+                sb.append(" — ").append(size(bytes));
+            }
+            return sb.toString();
+        }
     }
 
     private sealed interface Entry permits FolderEntry, DocEntry, AssetEntry {
@@ -187,6 +244,11 @@ public final class WorkspaceBrowserView extends StackPane {
 
     private static final int HISTORY = 50;
     private static final int RECENT_LIMIT = 200;
+    /** Width of the trailing hover-actions column: five 22 px buttons, four 2 px gaps, padding and slack. */
+    private static final double ACTIONS_WIDTH = 130;
+    /** Rubber band: how close to the table's top/bottom edge a drag auto-scrolls, and by how much per event. */
+    private static final double AUTOSCROLL_EDGE = 24;
+    private static final double AUTOSCROLL_STEP = 18;
     private static final double TILE_AREA_MAX = 236;
     private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
             .withZone(ZoneId.systemDefault());
@@ -219,9 +281,20 @@ public final class WorkspaceBrowserView extends StackPane {
     private MenuItem docPurge;
     private MenuItem docUntrack;
     private MenuItem docGoToFolder;
+    private MenuItem docSend;
+    private MenuItem docCopyPath;
+    private MenuItem assetReveal;
+    private MenuItem assetCopy;
+    private MenuItem assetSend;
+    private MenuItem assetUntrack;
     private Entry menuTarget;
     /** The documents "İndeksten Kaldır" / "Diskten Sil" act on: the selection when the menu opened on it. */
     private List<DocumentRecord> menuBatch = List.of();
+    /** The assets of that same selection (reveal, copy path, send and "Listeden Kaldır" cover them too). */
+    private List<BinaryAsset> menuAssets = List.of();
+    /** Selection changes are coalesced to one status-bar update per pulse (a rubber band fires many). */
+    private Runnable onSelectionChanged = () -> { };
+    private boolean selectionPulse;
 
     private final Deque<Place> backStack = new ArrayDeque<>();
     private final Deque<Place> forwardStack = new ArrayDeque<>();
@@ -244,9 +317,8 @@ public final class WorkspaceBrowserView extends StackPane {
 
         explorerView.getStyleClass().add("explorer-view");
         explorerView.setPadding(new Insets(6, 16, 0, 16));
-        VBox.setVgrow(folderTable, Priority.ALWAYS);
         folderTable.setPlaceholder(placeholder("Bu klasörde indekslenmiş belge yok."));
-        explorerView.getChildren().add(folderTable);
+        explorerView.getChildren().add(withRubberBand(folderTable));
 
         resultsSlot.getStyleClass().add("results-slot");
         installDropTarget();
@@ -282,8 +354,7 @@ public final class WorkspaceBrowserView extends StackPane {
         recentHeader.setMouseTransparent(true);
 
         recentTable.setPlaceholder(emptyWorkspace());
-        VBox.setVgrow(recentTable, Priority.ALWAYS);
-        homeView.getChildren().addAll(quickHeader, tileScroll, recentHeader, recentTable);
+        homeView.getChildren().addAll(quickHeader, tileScroll, recentHeader, withRubberBand(recentTable));
         syncQuickAccess();
     }
 
@@ -406,7 +477,20 @@ public final class WorkspaceBrowserView extends StackPane {
         TableColumn<Entry, Entry> chunks = column("Parça", SortKey.CHUNKS, 70,
                 Comparator.comparingLong(WorkspaceBrowserView::chunksOf));
         chunks.setCellFactory(c -> textCell(e -> e instanceof AssetEntry ? "—" : String.valueOf(chunksOf(e)), true));
-        table.getColumns().setAll(List.of(name, date, type, size, chunks));
+        // Hover actions at the row's right edge; shown by CSS (:hover / :selected), so no Java hover listeners.
+        TableColumn<Entry, Entry> quick = new TableColumn<>();
+        quick.getStyleClass().add("row-actions-column");
+        quick.setCellValueFactory(cd -> new ReadOnlyObjectWrapper<>(cd.getValue()));
+        quick.setCellFactory(c -> new ActionsCell());
+        quick.setSortable(false);
+        quick.setReorderable(false);
+        quick.setResizable(false);
+        quick.setMinWidth(ACTIONS_WIDTH);
+        quick.setPrefWidth(ACTIONS_WIDTH);
+        quick.setMaxWidth(ACTIONS_WIDTH);
+        table.getColumns().setAll(List.of(name, date, type, size, chunks, quick));
+        table.getSelectionModel().getSelectedIndices().addListener(
+                (javafx.collections.ListChangeListener<Integer>) change -> selectionChanged());
 
         // Folders always stay above documents, whatever column is sorted.
         table.setSortPolicy(t -> {
@@ -578,13 +662,24 @@ public final class WorkspaceBrowserView extends StackPane {
         return out;
     }
 
-    /** The documents a batch action applies to when it was started on {@code entry}. */
-    private static List<DocumentRecord> batchFor(TableView<Entry> table, Entry entry) {
-        if (!(entry instanceof DocEntry(DocumentRecord d))) {
-            return List.of();
+    /** The selected binary assets, copied like {@link #selectedDocuments}. */
+    private static List<BinaryAsset> selectedAssets(TableView<Entry> table) {
+        List<BinaryAsset> out = new ArrayList<>();
+        for (Entry e : List.copyOf(table.getSelectionModel().getSelectedItems())) {
+            if (e instanceof AssetEntry(BinaryAsset a)) {
+                out.add(a);
+            }
         }
-        List<DocumentRecord> selected = table == null ? List.of() : selectedDocuments(table);
-        return selected.size() > 1 && selected.contains(d) ? selected : List.of(d);
+        return out;
+    }
+
+    /** Whether an action started on {@code entry} applies to the whole selection (several rows, {@code entry} among them). */
+    private static boolean inMultiSelection(TableView<Entry> table, Entry entry) {
+        if (table == null || entry instanceof FolderEntry) {
+            return false;
+        }
+        List<Entry> selected = table.getSelectionModel().getSelectedItems();
+        return selected.size() > 1 && selected.contains(entry);
     }
 
     private void untrack(List<DocumentRecord> documents) {
@@ -626,6 +721,10 @@ public final class WorkspaceBrowserView extends StackPane {
             } else {
                 untrack(documents);
             }
+        } else if (code == KeyCode.BACK_SPACE && e.isShortcutDown() && !e.isShiftDown() && !e.isAltDown()
+                && !selectedDocuments(table).isEmpty()) {
+            // Finder's Cmd+Backspace (Ctrl+Backspace elsewhere); a plain Backspace stays "back".
+            untrack(selectedDocuments(table));
         } else if (selected instanceof DocEntry(DocumentRecord d)) {
             if (code == KeyCode.F3 && !e.isShortcutDown() && !e.isAltDown() && !e.isShiftDown()) {
                 actions.preview(d);
@@ -667,18 +766,23 @@ public final class WorkspaceBrowserView extends StackPane {
 
     private void buildMenus() {
         docOpen = docItem("Dosyayı Aç  (Enter)", actions::open);
-        docReveal = docItem("Klasörde Göster", actions::reveal);
+        docReveal = new MenuItem();
+        docReveal.setOnAction(e -> revealBatch());
+        // Quick Look shows one document: the row that was clicked.
         MenuItem preview = docItem("Önizle  (Space / F3)", actions::preview);
         docGoToFolder = docItem("Bulunduğu Klasöre Git", d -> navigate(new InFolder(parentOf(d))));
-        MenuItem copyPath = docItem("Yolu Kopyala  (Ctrl+C)", actions::copyPath);
+        docCopyPath = new MenuItem();
+        docCopyPath.setOnAction(e -> copyBatchPaths());
         MenuItem copyContent = docItem("İçeriği Kopyala  (Ctrl+Shift+C)", actions::copyContent);
+        docSend = new MenuItem();
+        docSend.setOnAction(e -> actions.send(menuBatch, menuAssets));
         docUntrack = new MenuItem();
         docUntrack.setOnAction(e -> untrack(menuBatch));
         docPurge = new MenuItem();
         docPurge.setOnAction(e -> purge(menuBatch));
         docPurge.getStyleClass().add("danger-item");
-        docMenu.getItems().addAll(docOpen, docReveal, preview, docGoToFolder, new SeparatorMenuItem(), copyPath,
-                copyContent, new SeparatorMenuItem(), docUntrack, docPurge);
+        docMenu.getItems().addAll(docOpen, docReveal, preview, docGoToFolder, new SeparatorMenuItem(), docCopyPath,
+                copyContent, new SeparatorMenuItem(), docSend, new SeparatorMenuItem(), docUntrack, docPurge);
 
         MenuItem open = folderItem("Aç", p -> navigate(new InFolder(p)));
         MenuItem reveal = folderItem("Dosya Gezgininde Göster", actions::revealFolder);
@@ -688,12 +792,53 @@ public final class WorkspaceBrowserView extends StackPane {
         folderMenu.getItems().addAll(open, reveal, copy, new SeparatorMenuItem(), rescan, rename);
 
         MenuItem assetOpen = assetItem("Dosyayı Aç  (Enter)", actions::openAsset);
-        MenuItem assetReveal = assetItem("Klasörde Göster", actions::revealAsset);
+        assetReveal = new MenuItem();
+        assetReveal.setOnAction(e -> revealBatch());
         assetGoToFolder = assetItem("Bulunduğu Klasöre Git", a -> navigate(new InFolder(parentOf(a.source()))));
-        MenuItem assetCopy = assetItem("Yolu Kopyala  (Ctrl+C)", actions::copyAssetPath);
-        MenuItem assetUntrack = assetItem("Listeden Kaldır  (Delete)", actions::untrackAsset);
+        assetCopy = new MenuItem();
+        assetCopy.setOnAction(e -> copyBatchPaths());
+        assetSend = new MenuItem();
+        assetSend.setOnAction(e -> actions.send(menuBatch, menuAssets));
+        assetUntrack = new MenuItem();
+        assetUntrack.setOnAction(e -> List.copyOf(menuAssets).forEach(actions::untrackAsset));
         assetMenu.getItems().addAll(assetOpen, assetReveal, assetGoToFolder, new SeparatorMenuItem(), assetCopy,
-                new SeparatorMenuItem(), assetUntrack);
+                new SeparatorMenuItem(), assetSend, new SeparatorMenuItem(), assetUntrack);
+    }
+
+    /** "Klasörde Göster" over the menu's batch: one row keeps the single action, several go to {@code revealAll}. */
+    private void revealBatch() {
+        if (menuBatch.size() + menuAssets.size() == 1) {
+            if (menuTarget instanceof DocEntry(DocumentRecord d)) {
+                actions.reveal(d);
+            } else if (menuTarget instanceof AssetEntry(BinaryAsset a)) {
+                actions.revealAsset(a);
+            }
+            return;
+        }
+        List<Path> files = new ArrayList<>();
+        for (DocumentRecord d : menuBatch) {
+            if (d.local()) { // peer documents have no local file
+                files.add(d.source());
+            }
+        }
+        menuAssets.forEach(a -> files.add(a.source()));
+        actions.revealAll(files);
+    }
+
+    /** "Yolu Kopyala" over the menu's batch: one row keeps the single action, several copy one path per line. */
+    private void copyBatchPaths() {
+        if (menuBatch.size() + menuAssets.size() == 1) {
+            if (menuTarget instanceof DocEntry(DocumentRecord d)) {
+                actions.copyPath(d);
+            } else if (menuTarget instanceof AssetEntry(BinaryAsset a)) {
+                actions.copyAssetPath(a);
+            }
+            return;
+        }
+        List<Path> files = new ArrayList<>();
+        menuBatch.forEach(d -> files.add(d.source()));
+        menuAssets.forEach(a -> files.add(a.source()));
+        actions.copyPaths(files);
     }
 
     private MenuItem assetItem(String text, Consumer<BinaryAsset> action) {
@@ -729,21 +874,39 @@ public final class WorkspaceBrowserView extends StackPane {
 
     private ContextMenu prepareMenu(Entry entry, TableView<Entry> table) {
         menuTarget = entry;
-        menuBatch = batchFor(table, entry);
+        boolean multi = inMultiSelection(table, entry);
+        menuBatch = multi ? selectedDocuments(table)
+                : entry instanceof DocEntry(DocumentRecord d) ? List.of(d) : List.of();
+        menuAssets = multi ? selectedAssets(table)
+                : entry instanceof AssetEntry(BinaryAsset a) ? List.of(a) : List.of();
+        int files = menuBatch.size() + menuAssets.size();
+        String fileCount = files > 1 ? " — " + files + " öğe" : "";
+        boolean anyLocal = !menuAssets.isEmpty() || menuBatch.stream().anyMatch(DocumentRecord::local);
+        boolean canSend = actions.canSend();
         if (entry instanceof DocEntry(DocumentRecord d)) {
             int n = menuBatch.size();
             String count = n > 1 ? " — " + n + " belge" : "";
             docUntrack.setText("İndeksten Kaldır" + count + "  (Delete)");
             docPurge.setText("Diskten Tamamen Sil…" + count + "  (Shift+Delete)");
+            docReveal.setText("Klasörde Göster" + fileCount);
+            docCopyPath.setText("Yolu Kopyala" + fileCount + "  (Ctrl+C)");
+            docSend.setText("Güvenli Gönder…" + fileCount);
+            docSend.setDisable(!canSend);
             // Peer documents have no local file to open, reveal or delete.
             docOpen.setDisable(!d.local());
-            docReveal.setDisable(!d.local());
+            docReveal.setDisable(files > 1 ? !anyLocal : !d.local());
             docPurge.setDisable(menuBatch.stream().noneMatch(DocumentRecord::local));
             Path parent = parentOf(d);
             docGoToFolder.setDisable(place instanceof InFolder(Path p) && p.equals(parent));
             return docMenu;
         }
         if (entry instanceof AssetEntry(BinaryAsset a)) {
+            int n = menuAssets.size();
+            assetReveal.setText("Klasörde Göster" + fileCount);
+            assetCopy.setText("Yolu Kopyala" + fileCount + "  (Ctrl+C)");
+            assetSend.setText("Güvenli Gönder…" + fileCount);
+            assetSend.setDisable(!canSend);
+            assetUntrack.setText("Listeden Kaldır" + (n > 1 ? " — " + n + " medya" : "") + "  (Delete)");
             Path parent = parentOf(a.source());
             assetGoToFolder.setDisable(place instanceof InFolder(Path p) && p.equals(parent));
             return assetMenu;
@@ -786,9 +949,6 @@ public final class WorkspaceBrowserView extends StackPane {
         private final Label name = new Label();
         private final Label location = new Label();
         private final VBox text = new VBox(1, name);
-        private final Button openButton = rowButton("↗", "Aç");
-        private final Button moreButton = rowButton("⋯", "Diğer işlemler");
-        private final HBox quick = new HBox(2, openButton, moreButton);
         private final HBox row;
         private String badgeStyle;
 
@@ -809,15 +969,109 @@ public final class WorkspaceBrowserView extends StackPane {
             text.setMinWidth(0);
             text.setAlignment(Pos.CENTER_LEFT);
             HBox.setHgrow(text, Priority.ALWAYS);
+            row = new HBox(8, icon, text);
+            row.setAlignment(Pos.CENTER_LEFT);
+            row.setMinWidth(0);
+        }
+
+        @Override
+        protected void updateItem(Entry entry, boolean empty) {
+            super.updateItem(entry, empty);
+            if (empty || entry == null) {
+                setGraphic(null);
+                return;
+            }
+            switch (entry) {
+                case FolderEntry(FolderIndex.Folder f) -> {
+                    icon.getChildren().setAll(folderIcon);
+                    name.setText(title(f));
+                    location.setText(f.documents() + " belge");
+                }
+                case DocEntry(DocumentRecord d) -> {
+                    String ext = d.type().extension().toLowerCase(Locale.ROOT);
+                    badge.setText(ext.toUpperCase(Locale.ROOT));
+                    String style = "type-" + ext;
+                    if (!style.equals(badgeStyle)) {
+                        if (badgeStyle != null) {
+                            badge.getStyleClass().remove(badgeStyle);
+                        }
+                        badge.getStyleClass().add(style);
+                        badgeStyle = style;
+                    }
+                    icon.getChildren().setAll(badge);
+                    name.setText(d.fileName());
+                    if (withLocation) {
+                        location.setText(locationOf(d));
+                    }
+                }
+                case AssetEntry(BinaryAsset a) -> {
+                    badge.setText(MediaCategory.of(a.fileName()).badge);
+                    String style = "type-media";
+                    if (!style.equals(badgeStyle)) {
+                        if (badgeStyle != null) {
+                            badge.getStyleClass().remove(badgeStyle);
+                        }
+                        badge.getStyleClass().add(style);
+                        badgeStyle = style;
+                    }
+                    icon.getChildren().setAll(badge);
+                    name.setText(a.fileName());
+                    if (withLocation) {
+                        location.setText(locationOf(parentOf(a.source())));
+                    }
+                }
+            }
+            setGraphic(row);
+        }
+    }
+
+    // ================================================================== hover actions
+
+    /**
+     * The trailing hover-action cell: Önizle (F3), Klasörde Göster, Güvenli Gönder, Aç and ⋯ (the context menu). CSS
+     * shows it only on the hovered or selected row. Buttons that do not apply to a row's kind are made invisible, not
+     * removed, so the cell's layout never changes while the table scrolls and reuses cells.
+     */
+    private final class ActionsCell extends TableCell<Entry, Entry> {
+        private final Button previewButton = rowButton("👁", "Önizle  (F3)");
+        private final Button revealButton = rowButton("📂", "Klasörde göster");
+        private final Button sendButton = rowButton("📤", "Güvenli gönder (şifreli LAN tüneli)");
+        private final Button openButton = rowButton("↗", "Aç");
+        private final Button moreButton = rowButton("⋯", "Diğer işlemler");
+        private final HBox quick = new HBox(2, previewButton, revealButton, sendButton, openButton, moreButton);
+
+        ActionsCell() {
+            getStyleClass().add("actions-cell");
             quick.getStyleClass().add("row-actions");
             quick.setAlignment(Pos.CENTER_RIGHT);
-            quick.setMinWidth(USE_PREF_SIZE);
+            previewButton.setOnAction(e -> withItem(entry -> {
+                switch (entry) {
+                    case DocEntry(DocumentRecord d) -> actions.preview(d);
+                    case AssetEntry(BinaryAsset a) -> actions.openAsset(a); // media: the OS application previews
+                    case FolderEntry f -> { }
+                }
+            }));
+            revealButton.setOnAction(e -> withItem(entry -> {
+                switch (entry) {
+                    case DocEntry(DocumentRecord d) -> actions.reveal(d);
+                    case AssetEntry(BinaryAsset a) -> actions.revealAsset(a);
+                    case FolderEntry(FolderIndex.Folder f) -> actions.revealFolder(f.path());
+                }
+            }));
+            // Like the context menu: on a row inside a multi-selection, the whole selection is sent.
+            sendButton.setOnAction(e -> withItem(entry -> {
+                TableView<Entry> table = getTableView();
+                if (inMultiSelection(table, entry)) {
+                    actions.send(selectedDocuments(table), selectedAssets(table));
+                } else if (entry instanceof DocEntry(DocumentRecord d)) {
+                    actions.send(List.of(d), List.of());
+                } else if (entry instanceof AssetEntry(BinaryAsset a)) {
+                    actions.send(List.of(), List.of(a));
+                }
+            }));
             openButton.setOnAction(e -> withItem(WorkspaceBrowserView.this::activate));
             moreButton.setOnAction(e -> withItem(entry -> showMenu(entry, getTableView(), moreButton, Side.BOTTOM,
                     0, 0)));
-            row = new HBox(8, icon, text, quick);
-            row.setAlignment(Pos.CENTER_LEFT);
-            row.setMinWidth(0);
         }
 
         private void withItem(Consumer<Entry> action) {
@@ -836,52 +1090,35 @@ public final class WorkspaceBrowserView extends StackPane {
                 return;
             }
             switch (entry) {
-                case FolderEntry(FolderIndex.Folder f) -> {
-                    icon.getChildren().setAll(folderIcon);
-                    name.setText(title(f));
-                    location.setText(f.documents() + " belge");
+                case FolderEntry f -> {
+                    previewButton.setVisible(false);
+                    sendButton.setVisible(false);
+                    revealButton.setDisable(false);
+                    revealButton.getTooltip().setText("Dosya Gezgininde göster");
                     openButton.setDisable(false);
                     openButton.getTooltip().setText("Klasörü aç");
                 }
                 case DocEntry(DocumentRecord d) -> {
-                    String ext = d.type().extension().toLowerCase(Locale.ROOT);
-                    badge.setText(ext.toUpperCase(Locale.ROOT));
-                    String style = "type-" + ext;
-                    if (!style.equals(badgeStyle)) {
-                        if (badgeStyle != null) {
-                            badge.getStyleClass().remove(badgeStyle);
-                        }
-                        badge.getStyleClass().add(style);
-                        badgeStyle = style;
-                    }
-                    icon.getChildren().setAll(badge);
-                    name.setText(d.fileName());
-                    if (withLocation) {
-                        location.setText(locationOf(d));
-                    }
+                    previewButton.setVisible(true);
+                    previewButton.getTooltip().setText("Önizle  (F3)");
+                    sendButton.setVisible(true);
+                    // Peer documents have no local file to reveal or open.
+                    revealButton.setDisable(!d.local());
+                    revealButton.getTooltip().setText("Klasörde göster");
                     openButton.setDisable(!d.local());
                     openButton.getTooltip().setText("Dosyayı aç");
                 }
-                case AssetEntry(BinaryAsset a) -> {
-                    badge.setText(MediaCategory.of(a.fileName()).badge);
-                    String style = "type-media";
-                    if (!style.equals(badgeStyle)) {
-                        if (badgeStyle != null) {
-                            badge.getStyleClass().remove(badgeStyle);
-                        }
-                        badge.getStyleClass().add(style);
-                        badgeStyle = style;
-                    }
-                    icon.getChildren().setAll(badge);
-                    name.setText(a.fileName());
-                    if (withLocation) {
-                        location.setText(locationOf(parentOf(a.source())));
-                    }
+                case AssetEntry a -> {
+                    previewButton.setVisible(true);
+                    previewButton.getTooltip().setText("Varsayılan uygulamada önizle  (F3)");
+                    sendButton.setVisible(true);
+                    revealButton.setDisable(false);
+                    revealButton.getTooltip().setText("Klasörde göster");
                     openButton.setDisable(false);
                     openButton.getTooltip().setText("Varsayılan uygulamada aç");
                 }
             }
-            setGraphic(row);
+            setGraphic(quick);
         }
     }
 
@@ -908,6 +1145,250 @@ public final class WorkspaceBrowserView extends StackPane {
             sb.append(sb.isEmpty() ? "" : "  ›  ").append(title(f));
         }
         return sb.toString();
+    }
+
+    // ================================================================== selection summary
+
+    /** Called by the status bar owner after selection changes, at most once per pulse. */
+    public void setOnSelectionChanged(Runnable listener) {
+        this.onSelectionChanged = Objects.requireNonNull(listener);
+    }
+
+    private void selectionChanged() {
+        if (selectionPulse) {
+            return;
+        }
+        selectionPulse = true;
+        javafx.application.Platform.runLater(() -> {
+            selectionPulse = false;
+            onSelectionChanged.run();
+        });
+    }
+
+    /** What the visible table has selected; {@link SelectionSummary#NONE} in the results view. */
+    public SelectionSummary selectionSummary() {
+        TableView<Entry> table = visibleTable();
+        if (table == null) {
+            return SelectionSummary.NONE;
+        }
+        List<Entry> selected = table.getSelectionModel().getSelectedItems();
+        if (selected.isEmpty()) {
+            return SelectionSummary.NONE;
+        }
+        int files = 0;
+        int folders = 0;
+        long bytes = 0;
+        for (Entry e : selected) {
+            if (e == null) {
+                continue;
+            }
+            if (e instanceof FolderEntry) {
+                folders++;
+            } else {
+                files++;
+                bytes += bytesOf(e);
+            }
+        }
+        return new SelectionSummary(files, folders, bytes);
+    }
+
+    // ================================================================== rubber-band selection
+
+    /** Stacks a mouse-transparent overlay over {@code table} for the selection rectangle and installs the gesture. */
+    private static StackPane withRubberBand(TableView<Entry> table) {
+        Rectangle band = new Rectangle();
+        band.getStyleClass().add("rubber-band");
+        band.setManaged(false);
+        band.setVisible(false);
+        Pane layer = new Pane(band);
+        layer.setMouseTransparent(true);
+        layer.setPickOnBounds(false);
+        StackPane host = new StackPane(table, layer);
+        host.setMinHeight(0);
+        VBox.setVgrow(host, Priority.ALWAYS);
+        new RubberBand(table, band).install();
+        return host;
+    }
+
+    /**
+     * Explorer-style lasso: a primary-button drag that starts on the table's empty area (below the last row or on an
+     * empty filler row) selects every row the rectangle spans; with {@code Ctrl}/{@code Cmd} it adds to the existing
+     * selection. A plain click on the empty area clears the selection. Rows are found from the few visible cells of
+     * the virtual flow, so the cost per mouse event is independent of the table's size; the selection is rewritten
+     * only when the spanned range actually changes. Dragging near the top or bottom edge scrolls.
+     */
+    private static final class RubberBand {
+        private final TableView<Entry> table;
+        private final Rectangle band;
+        private VirtualFlow<?> flow;
+        private boolean armed;
+        private boolean active;
+        private double anchorX;
+        private double anchorY;
+        private int anchorIndex;
+        private int lastLo;
+        private int lastHi;
+        private int[] base = new int[0];
+
+        RubberBand(TableView<Entry> table, Rectangle band) {
+            this.table = table;
+            this.band = band;
+        }
+
+        void install() {
+            table.addEventFilter(MouseEvent.MOUSE_PRESSED, this::pressed);
+            table.addEventFilter(MouseEvent.MOUSE_DRAGGED, this::dragged);
+            table.addEventFilter(MouseEvent.MOUSE_RELEASED, this::released);
+        }
+
+        private void pressed(MouseEvent e) {
+            armed = false;
+            if (e.getButton() != MouseButton.PRIMARY || e.getClickCount() > 1 || table.getItems().isEmpty()
+                    || !inEmptyArea(e.getPickResult().getIntersectedNode()) || flow() == null) {
+                return;
+            }
+            armed = true;
+            active = false;
+            anchorX = e.getX();
+            anchorY = e.getY();
+            anchorIndex = indexAt(anchorY);
+            lastLo = Integer.MIN_VALUE;
+            lastHi = Integer.MIN_VALUE;
+            base = e.isShortcutDown()
+                    ? table.getSelectionModel().getSelectedIndices().stream().mapToInt(Integer::intValue).toArray()
+                    : new int[0];
+            if (!e.isShortcutDown() && !e.isShiftDown()) {
+                table.getSelectionModel().clearSelection(); // a click on the empty area deselects, like Explorer
+            }
+            table.requestFocus();
+            e.consume();
+        }
+
+        private void dragged(MouseEvent e) {
+            if (!armed) {
+                return;
+            }
+            e.consume();
+            if (!active) {
+                if (Math.abs(e.getX() - anchorX) < 4 && Math.abs(e.getY() - anchorY) < 4) {
+                    return; // a jittery click is not a drag
+                }
+                active = true;
+                band.setVisible(true);
+            }
+            Bounds area = flowArea();
+            double y = e.getY();
+            if (y < area.getMinY() + AUTOSCROLL_EDGE) {
+                anchorY -= flow.scrollPixels(-AUTOSCROLL_STEP);
+            } else if (y > area.getMaxY() - AUTOSCROLL_EDGE) {
+                anchorY -= flow.scrollPixels(AUTOSCROLL_STEP);
+            }
+            double x = clamp(e.getX(), area.getMinX(), area.getMaxX());
+            y = clamp(y, area.getMinY(), area.getMaxY());
+            double ax = clamp(anchorX, area.getMinX(), area.getMaxX());
+            double ay = clamp(anchorY, area.getMinY(), area.getMaxY());
+            band.setX(Math.min(ax, x));
+            band.setY(Math.min(ay, y));
+            band.setWidth(Math.abs(x - ax));
+            band.setHeight(Math.abs(y - ay));
+            select(indexAt(y));
+        }
+
+        private void released(MouseEvent e) {
+            if (!armed) {
+                return;
+            }
+            armed = false;
+            active = false;
+            band.setVisible(false);
+            e.consume();
+        }
+
+        /** Selects the rows between the anchor and {@code current} (plus the Ctrl base); a no-op if unchanged. */
+        private void select(int current) {
+            int n = table.getItems().size();
+            int lo = Math.min(anchorIndex, current);
+            int hi = Math.min(Math.max(anchorIndex, current), n - 1);
+            if (lo == lastLo && hi == lastHi) {
+                return;
+            }
+            lastLo = lo;
+            lastHi = hi;
+            var sm = table.getSelectionModel();
+            sm.clearSelection();
+            if (lo <= hi) {
+                sm.selectRange(lo, hi + 1);
+            }
+            for (int i : base) {
+                if (i < n) {
+                    sm.select(i);
+                }
+            }
+            if (lo <= hi) {
+                table.getFocusModel().focus(current < n ? Math.max(current, 0) : hi);
+            }
+        }
+
+        /**
+         * The row under {@code y} (table coordinates): above the first visible row counts as that row, below the last
+         * row is {@code items.size()} ("past the end").
+         */
+        private int indexAt(double y) {
+            VirtualFlow<?> f = flow();
+            int n = table.getItems().size();
+            IndexedCell<?> first = f == null ? null : f.getFirstVisibleCell();
+            IndexedCell<?> last = f == null ? null : f.getLastVisibleCell();
+            if (first == null || last == null) {
+                return n;
+            }
+            int end = Math.min(last.getIndex(), n - 1);
+            for (int i = Math.max(first.getIndex(), 0); i <= end; i++) {
+                IndexedCell<?> cell = f.getVisibleCell(i);
+                if (cell == null) {
+                    continue;
+                }
+                Bounds b = table.sceneToLocal(cell.localToScene(cell.getLayoutBounds()));
+                if (y < b.getMaxY()) {
+                    return i;
+                }
+            }
+            return n;
+        }
+
+        /** The rows' viewport in table coordinates (below the column header, left of the scroll bar). */
+        private Bounds flowArea() {
+            VirtualFlow<?> f = flow();
+            return f == null ? table.getLayoutBounds() : table.sceneToLocal(f.localToScene(f.getLayoutBounds()));
+        }
+
+        private VirtualFlow<?> flow() {
+            if (flow == null && table.lookup(".virtual-flow") instanceof VirtualFlow<?> f) {
+                flow = f;
+            }
+            return flow;
+        }
+
+        /** Whether a press on {@code node} is on the rows' empty area (not a filled row, header, scroll bar or placeholder). */
+        private boolean inEmptyArea(Node node) {
+            boolean inFlow = false;
+            for (Node n = node; n != null && n != table; n = n.getParent()) {
+                if (n instanceof TableRow<?> row) {
+                    return row.isEmpty() || row.getItem() == null;
+                }
+                if (n instanceof ScrollBar || n instanceof ButtonBase || n.getStyleClass().contains("placeholder")
+                        || n.getStyleClass().contains("column-header-background")) {
+                    return false;
+                }
+                if (n instanceof VirtualFlow<?>) {
+                    inFlow = true;
+                }
+            }
+            return inFlow;
+        }
+
+        private static double clamp(double v, double min, double max) {
+            return Math.max(min, Math.min(max, v));
+        }
     }
 
     // ================================================================== drop target

@@ -1,0 +1,2 @@
+// Verbatim port of video_uretme_prompt's engine (deterministic, no network, no dependencies).
+// Only the package name changed: org.example.videoprompt -> org.yazi.motion. See PORTING.md.

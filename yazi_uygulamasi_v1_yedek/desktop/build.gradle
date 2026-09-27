@@ -1,0 +1,31 @@
+apply plugin: 'application'
+
+// JavaFX is declared per module with the Windows classifier instead of via the OpenJFX Gradle plugin
+// (its last release predates Gradle 9). Only base/graphics/controls: no javafx-web, so no browser engine.
+def javafxVersion = '21.0.12'
+def javafxPlatform = 'win'
+
+dependencies {
+    implementation project(':prose')
+    implementation project(':motion')
+    implementation project(':visual')
+    implementation project(':metaprompt')
+    implementation "org.openjfx:javafx-base:${javafxVersion}:${javafxPlatform}"
+    implementation "org.openjfx:javafx-graphics:${javafxVersion}:${javafxPlatform}"
+    implementation "org.openjfx:javafx-controls:${javafxVersion}:${javafxPlatform}"
+    implementation 'org.fxmisc.richtext:richtextfx:0.11.7'
+}
+
+application {
+    // Launcher does not extend Application, which lets JavaFX start from the classpath.
+    mainClass = 'org.yazi.desktop.Launcher'
+    applicationDefaultJvmArgs = ['-Dfile.encoding=UTF-8', '--enable-native-access=ALL-UNNAMED']
+}
+
+tasks.named('run') {
+    workingDir = rootProject.projectDir
+}
+
+dependencies {
+    testImplementation testFixtures(project(':gateway'))
+}

@@ -1,0 +1,63 @@
+/* Calm, low-contrast chrome so the text is the only thing that draws the eye. */
+
+.root {
+    -yazi-paper: #fbfaf7;
+    -yazi-ink: #1f2328;
+    -yazi-muted: #6b7079;
+    -yazi-line: #e3e1dc;
+    -yazi-chrome: #f1efea;
+    -yazi-accent: #3a6ea5;
+    -fx-font-size: 13px;
+}
+
+.yazi-editor {
+    -fx-background-color: -yazi-paper;
+    -fx-padding: 24 48 24 48;
+    -fx-font-family: "Georgia", "Cambria", serif;
+    -fx-font-size: 16px;
+}
+
+.yazi-editor .text {
+    -fx-fill: -yazi-ink;
+}
+
+.yazi-editor .caret {
+    -fx-stroke: -yazi-accent;
+}
+
+.yazi-editor .selection {
+    -fx-fill: #cfe0f5;
+}
+
+/* Model text that is not part of the document yet. */
+.yazi-editor .text.ai-ghost {
+    -fx-fill: #7d8590;
+}
+
+/* Text a pending rewrite would replace. */
+.yazi-editor .text.ai-target {
+    -fx-fill: #a3a8b0;
+    -fx-strikethrough: true;
+}
+
+.command-bar {
+    -fx-background-color: -yazi-chrome;
+    -fx-border-color: -yazi-line transparent transparent transparent;
+}
+
+.status-bar {
+    -fx-background-color: -yazi-chrome;
+}
+
+.side-panel {
+    -fx-background-color: -yazi-chrome;
+}
+
+.panel-title {
+    -fx-font-weight: bold;
+    -fx-text-fill: -yazi-ink;
+}
+
+.muted {
+    -fx-text-fill: -yazi-muted;
+}

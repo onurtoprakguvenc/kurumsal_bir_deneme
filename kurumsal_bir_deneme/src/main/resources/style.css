@@ -1644,6 +1644,47 @@
     visibility: visible;
 }
 
+/* The trailing hover-actions column: no header text, no separator, buttons flush right. */
+.explorer-table .table-cell.actions-cell {
+    -fx-padding: 0 4 0 0;
+    -fx-alignment: center-right;
+}
+
+.explorer-table .row-actions {
+    -fx-spacing: 2;
+    -fx-padding: 0;
+}
+
+/* Small, minimal ghost buttons; a comfortable 22 px square hit target. */
+.explorer-table .row-action-button {
+    -fx-background-color: transparent;
+    -fx-background-radius: 5;
+    -fx-text-fill: #9a9aa6;
+    -fx-font-size: 11px;
+    -fx-padding: 0;
+    -fx-min-width: 22px;
+    -fx-pref-width: 22px;
+    -fx-min-height: 22px;
+    -fx-pref-height: 22px;
+}
+
+.explorer-table .row-action-button:hover {
+    -fx-background-color: #2e2e38;
+    -fx-text-fill: #ffffff;
+}
+
+.explorer-table .row-action-button:pressed {
+    -fx-background-color: #3a3470;
+}
+
+/* Rubber-band (lasso) selection rectangle. */
+.rubber-band {
+    -fx-fill: rgba(109, 92, 240, 0.16);
+    -fx-stroke: #6d5cf0;
+    -fx-stroke-width: 1;
+    -fx-stroke-type: inside;
+}
+
 .type-badge.type-ppt {
     -fx-text-fill: #f0a35e;
 }

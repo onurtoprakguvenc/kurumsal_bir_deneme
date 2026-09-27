@@ -14,6 +14,7 @@ import org.example.p2p.LanSecurity;
 import org.example.p2p.LanSyncService;
 import org.example.p2p.MachineKey;
 import org.example.p2p.PeerDiscovery;
+import org.example.p2p.PeerInfo;
 import org.example.p2p.TrustStore;
 import org.example.p2p.ZeroTrust;
 import org.example.platform.OsShellBridge;
@@ -426,10 +427,48 @@ public final class ZeroTrustTestRunner {
                 waitFor(() -> a.sync().store().acl().entries(sha).isEmpty());
                 check("the grant is used up by that transfer", a.sync().store().acl().entries(sha).isEmpty(),
                         a.sync().store().acl().entries(sha).toString());
+
+                // "Güvenli Gönder": a push through the tunnel that never widens the access lists.
+                PeerInfo peerB = peerOf(a, b);
+                PeerInfo peerX = peerOf(a, x);
+                check("secure push: a full peer that already holds the document answers 'already present'",
+                        a.sync().canPush(peerB, sha) && a.sync().push(peerB, sha).outcome()
+                                == FileTransferService.Outcome.ALREADY_PRESENT, "");
+                Path privateDoc = write(root.resolve("src/ozel plan.txt"), "Mavikanat iç planı.\n".repeat(30));
+                String privateSha = Hashing.sha256Hex(privateDoc);
+                a.controller().addPath(privateDoc, InternalTerminalEngine.Output.NONE);
+                waitFor(() -> a.sync().store().isShared(privateSha));
+                check("secure push: a guest without a grant is not a target, and a forced push is refused",
+                        !a.sync().canPush(peerX, privateSha) && pushRefused(a, peerX, privateSha), "");
+                a.sync().store().acl().grant(privateSha, "dept:Hukuk");
+                check("secure push: a restricted document is not pushable to a full peer outside its list",
+                        !a.sync().canPush(peerB, privateSha) && pushRefused(a, peerB, privateSha), "");
+                a.sync().store().acl().grant(privateSha, x.trust().identity().fingerprint());
+                FileTransferService.Outcome pushed = a.sync().push(peerX, privateSha).outcome();
+                waitFor(() -> x.controller().document(privateSha).isPresent());
+                check("secure push: a granted guest receives the pushed document, verified and indexed",
+                        pushed != FileTransferService.Outcome.RECEIVED && x.controller().document(privateSha).isPresent(),
+                        String.valueOf(pushed));
             } finally {
                 sniffing.set(false);
                 nodes.forEach(SyncNode::close);
             }
+        }
+    }
+
+    /** {@code to} as {@code from}'s discovery sees it. */
+    private static PeerInfo peerOf(SyncNode from, SyncNode to) {
+        String fp = to.trust().identity().fingerprint();
+        return from.sync().peers().stream().filter(p -> p.nodeId().equals(fp)).findFirst()
+                .orElseThrow(() -> new IllegalStateException(from.name() + " does not see " + to.name()));
+    }
+
+    private static boolean pushRefused(SyncNode from, PeerInfo to, String sha) {
+        try {
+            from.sync().push(to, sha);
+            return false;
+        } catch (IOException e) {
+            return true;
         }
     }
 

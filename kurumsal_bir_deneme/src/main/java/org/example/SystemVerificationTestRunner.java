@@ -29,6 +29,7 @@ import org.example.state.PanelStateCoordinator.Panel;
 import org.example.state.ViewModeCoordinator.MemorySnapshot;
 import org.example.state.ViewModeCoordinator.ViewMode;
 import org.example.ui.CommandBarView.Mode;
+import org.example.ui.WorkspaceBrowserView.SelectionSummary;
 import org.example.workbench.ExtendedWorkbenchController;
 import org.example.workbench.WorkbenchController;
 import org.example.workbench.WorkbenchController.RemovalResult;
@@ -101,6 +102,7 @@ public final class SystemVerificationTestRunner {
         clipboardRoutines(root.resolve("clip"));
         contextActions(root.resolve("ctx"));
         commandBarModes();
+        selectionSummary();
         specRegression(root.resolve("specs"));
         projectsEndToEnd(root.resolve("home"), root.resolve("proj-docs"));
         heapUnderLoad(root.resolve("load"));
@@ -303,6 +305,19 @@ public final class SystemVerificationTestRunner {
                     String.format(Locale.ROOT, "%.1f ms", ms));
             check("…and completes in the background", future.get(5, TimeUnit.SECONDS).ok(), "");
         }
+    }
+
+    // ================================================================== explorer selection summary
+
+    private void selectionSummary() {
+        section("Explorer: status-bar summary of a multi-selection");
+        check("nothing selected shows nothing", SelectionSummary.NONE.describe().isEmpty(), "");
+        String files = new SelectionSummary(3, 0, 14_889_779L).describe();
+        check("files: count and total size", files.equals("3 dosya seçildi — 14.2 MB"), files);
+        String mixed = new SelectionSummary(2, 1, 3L << 20).describe();
+        check("files and folders together", mixed.equals("2 dosya, 1 klasör seçildi — 3.0 MB"), mixed);
+        String folder = new SelectionSummary(0, 1, 0).describe();
+        check("folders only: no size", folder.equals("1 klasör seçildi"), folder);
     }
 
     // ================================================================== command bar

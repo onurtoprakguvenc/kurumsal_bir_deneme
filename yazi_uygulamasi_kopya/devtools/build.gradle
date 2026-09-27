@@ -1,0 +1,15 @@
+apply plugin: 'application'
+
+dependencies {
+    implementation project(':core-text')
+    implementation project(':gateway')
+}
+
+application {
+    mainClass = 'org.yazi.devtools.SmokeCheck'
+    applicationDefaultJvmArgs = ['-Dfile.encoding=UTF-8', '-Dstdout.encoding=UTF-8']
+}
+
+tasks.named('run') {
+    workingDir = rootProject.projectDir   // relative file paths resolve from the repo root
+}
